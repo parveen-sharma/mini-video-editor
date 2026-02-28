@@ -1,6 +1,6 @@
 # Mini Video Editor — Horizontal → Vertical Shorts
 
-Converts a horizontal explainer video into portrait-format (9:16) short clips with
+Converts a horizontal video into portrait-format (9:16) short clips with
 karaoke-style word-by-word highlighted subtitles and an optional logo overlay.
 
 ---
