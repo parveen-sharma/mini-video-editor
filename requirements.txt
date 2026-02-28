@@ -1,0 +1,5 @@
+openai-whisper
+opencv-python
+numpy
+tqdm
+scenedetect
