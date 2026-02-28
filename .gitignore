@@ -1,0 +1,20 @@
+# Video Files & Outputs
+output/
+videos/
+*.mp4
+*.mkv
+
+# Python Environment
+__pycache__/
+.venv/
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Other folders
+other/
+
+# Other files
+numberDesign.png
