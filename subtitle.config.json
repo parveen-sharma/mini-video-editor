@@ -2,7 +2,7 @@
   "//": "==============================",
   "enabled": true,
   "//layout": "karaoke | static | sentence",
-  "mode": "karaoke",
+  "mode": "sentence",
   "//max_words_per_line": "Controls line breaking before wrapping",
   "max_words_per_line": 4,
   "//max_lines": "Total lines visible at once (2 = 2x2 layout)",

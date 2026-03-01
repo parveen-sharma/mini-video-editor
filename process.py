@@ -3,72 +3,19 @@ from pathlib import Path
 from tqdm import tqdm
 import whisper, cv2, numpy as np
 
-# =========================
-# PATHS
-# =========================
-
-ROOT = Path(".")
-CONFIG_PATH = ROOT / "subtitle.config.json"
-
-# =========================
-# LOAD SUBTITLE CONFIG
-# =========================
-
-if not CONFIG_PATH.exists():
-    raise RuntimeError("subtitle.config.json not found in project root")
-
-with open(CONFIG_PATH, "r", encoding="utf8") as f:
-    CFG = json.load(f)
-
-FONT               = CFG["font"]["family"]
-FONT_SIZE          = CFG["font"]["size"]
-
-MAX_WORDS_PER_LINE = CFG["max_words_per_line"]
-MAX_LINES          = CFG["max_lines"]
-
-MARGIN_H           = CFG["margin_horizontal_px"]
-MARGIN_V           = CFG["margin_vertical_px"]
-
-ACTIVE_COLOR       = CFG["highlight"]["text_color"]
-INACTIVE_COLOR     = CFG["font"]["inactive_color"]
-
-BG_COLOR           = CFG["highlight"]["background_color"]
-BG_OPACITY         = CFG["highlight"]["background_opacity"]   # 0-1
-
-PAD_X              = CFG["highlight"]["padding_x"]
-PAD_Y              = CFG["highlight"]["padding_y"]
-
-ALIGNMENT          = 8      # bottom-center (ASS standard)
-BG_BORD            = PAD_Y + 6
-
-# Portrait output dimensions — must match ASS PlayRes values exactly.
-OUT_W, OUT_H       = 1080, 1920
-
-# Pre-crop settings — driven by subtitle.config.json ["precrop"].
-#
-# Separate anchor keys (preferred):
-#   horizontal_anchor → left | center | right
-#   vertical_anchor   → top  | middle | bottom
-#
-# Backward compat: if the new keys are absent, the old combined
-#   "anchor": "vertical-horizontal"  string is parsed as fallback.
-_pc          = CFG.get("precrop", {})
-PC_W         = float(_pc.get("horizontal_keep_pct", 0.84))
-PC_H         = float(_pc.get("vertical_keep_pct",   0.84))
-
-# Read new separate keys first; fall back to splitting old combined key
-_h_anc = str(_pc.get("horizontal_anchor", "")).lower().strip()
-_v_anc = str(_pc.get("vertical_anchor",   "")).lower().strip()
-if not _h_anc or not _v_anc:
-    _old_parts = str(_pc.get("anchor", "middle-center")).lower().strip().split("-")
-    _v_anc = _v_anc or (_old_parts[0] if len(_old_parts) > 0 else "middle")
-    _h_anc = _h_anc or (_old_parts[1] if len(_old_parts) > 1 else "center")
-PC_H_ANCHOR = _h_anc   # left | center | right
-PC_V_ANCHOR = _v_anc   # top  | middle | bottom
-
-# Duration of the zoom-out outro appended to every scene.
-# Set to 0 to disable. Capped at 30% of scene duration so short scenes are safe.
-ZOOM_OUT_DURATION  = 1.5    # seconds
+from config import (
+    CFG, LOGO_CFG,
+    FONT, FONT_SIZE,
+    MAX_WORDS_PER_LINE, MAX_LINES,
+    MARGIN_H, MARGIN_V,
+    ACTIVE_COLOR, INACTIVE_COLOR,
+    BG_COLOR, BG_OPACITY, PAD_X, PAD_Y,
+    HL_ENABLED, EXTEND_LAST_WORD_SEC, PAUSE_THRESHOLD_SEC,
+    ALIGNMENT, BG_BORD,
+    OUT_W, OUT_H,
+    PC_W, PC_H, PC_H_ANCHOR, PC_V_ANCHOR,
+    ZOOM_OUT_DURATION, SNAP_TOLERANCE_SEC,
+)
 
 # =========================
 # UTILS
@@ -490,8 +437,19 @@ def _probe_dimensions(src: str) -> tuple:
         "-of", "csv=p=0",
         str(src),
     ], text=True).strip()
-    w, h = out.split(",")
-    return int(w), int(h)
+    # MOV files (e.g. iPhone) can have multiple streams (video + timecode track).
+    # ffprobe returns one line per stream — take only the first non-empty line
+    # with exactly two comma-separated integer values (width,height).
+    for line in out.splitlines():
+        # Strip trailing commas/whitespace, filter empty tokens.
+        # iPhone MOV files produce "1920,1080," (trailing comma) which
+        # splits to ["1920", "1080", ""] — filtering empties handles it.
+        parts = [p for p in line.strip().split(",") if p.strip()]
+        if len(parts) == 2 and all(p.isdigit() for p in parts):
+            return int(parts[0]), int(parts[1])
+    raise ValueError(
+        f"Could not parse video dimensions from ffprobe output:\n{out}"
+    )
 
 
 def _precrop_offsets(src_w: int, src_h: int) -> tuple:
@@ -757,7 +715,7 @@ def chunk_words(words):
         return []
 
     max_chunk     = MAX_WORDS_PER_LINE * MAX_LINES
-    gap_threshold = CFG.get("pause_threshold_ms", 400) / 1000.0
+    gap_threshold = PAUSE_THRESHOLD_SEC
 
     chunks, current = [], [words[0]]
 
@@ -895,8 +853,8 @@ def write_ass(path, scene_words):
     act_c      = ass_color(ACTIVE_COLOR)
     bg_alpha   = opacity_to_alpha(BG_OPACITY)
     bg_c       = ass_color(BG_COLOR, alpha=bg_alpha)
-    extend     = CFG["extend_last_word_ms"] / 1000.0
-    hl_enabled = CFG["highlight"]["enabled"]
+    extend     = EXTEND_LAST_WORD_SEC
+    hl_enabled = HL_ENABLED
 
     with open(path, "w", encoding="utf8") as f:
         _ass_header(f, inact_c)
@@ -976,7 +934,7 @@ def _build_logo_filter(ass_escaped: str, logo_path: str) -> tuple:
       [1:v] → scale to logo_w × -1 → [logo_scaled]
       [subbed][logo_scaled] → overlay at (ox, oy) with opacity → [out]
     """
-    logo_cfg = CFG.get("logo", {})
+    logo_cfg = LOGO_CFG
 
     if not logo_cfg.get("enabled", False):
         return [], None, None
@@ -1176,7 +1134,7 @@ Common workflows:
     # been locked yet. Re-runs after --regen-words to use new timestamps.
     if words and (args.regen_words or args.regen_splits or not meta.exists()):
         print("✂️  Snapping scene boundaries to word ends…")
-        snap_tolerance = CFG.get("snap_tolerance_sec", 1.0)
+        snap_tolerance = SNAP_TOLERANCE_SEC
         scenes = snap_scenes_to_words(scenes, words, tolerance=snap_tolerance)
         data["scenes"] = scenes
         json.dump(data, open(meta, "w", encoding="utf8"), indent=2)
