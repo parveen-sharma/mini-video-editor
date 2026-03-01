@@ -5,17 +5,34 @@ import whisper, cv2, numpy as np
 
 from config import (
     CFG, LOGO_CFG,
-    FONT, FONT_SIZE,
     MAX_WORDS_PER_LINE, MAX_LINES,
     MARGIN_H, MARGIN_V,
-    ACTIVE_COLOR, INACTIVE_COLOR,
+    ACTIVE_COLOR,
     BG_COLOR, BG_OPACITY, PAD_X, PAD_Y,
     HL_ENABLED, EXTEND_LAST_WORD_SEC, PAUSE_THRESHOLD_SEC,
     ALIGNMENT, BG_BORD,
     OUT_W, OUT_H,
     PC_W, PC_H, PC_H_ANCHOR, PC_V_ANCHOR,
     ZOOM_OUT_DURATION, SNAP_TOLERANCE_SEC,
+    # Processing constants (formerly hardcoded in functions)
+    SCENE_SAMPLE_FPS, SCENE_DIFF_THRESHOLD, SCENE_MIN_DURATION_SEC,
+    MOTION_THRESHOLD, ANALYSIS_SAMPLE_FPS,
+    MOTION_PIXEL_THRESHOLD, SALIENCY_CENTER_DEADBAND,
+    BLUR_LUMA_RADIUS, BLUR_LUMA_POWER, BLUR_OPENCV_KSIZE,
+    ZOOM_OUT_ENABLED, ZOOM_OUT_MAX_PCT,
+    ENCODE_CRF_PRECROP, ENCODE_CRF_SCENES, ENCODE_AUDIO_BR, ENCODE_PRESET,
+    FACE_DETECTION_ENABLED,
+    SUBTITLE_PRESET   
 )
+
+# =========================
+# FONTS
+# =========================
+
+# Absolute path to the fonts/ folder next to this script.
+# Using __file__ makes it work regardless of which directory you run from.
+# Passed to ffmpeg subtitles filter as fontsdir= so custom preset fonts load.
+FONTS_DIR = str(Path(__file__).resolve().parent / "fonts").replace("\\", "/").replace(":", "\\:")
 
 # =========================
 # UTILS
@@ -44,14 +61,52 @@ def opacity_to_alpha(opacity: float) -> int:
     """Config opacity 0-1 → ASS alpha 0-255 (inverted)."""
     return int(255 * (1.0 - max(0.0, min(1.0, opacity))))
 
+def _get_face_bounds(frame_bgr):
+    """Returns the normalized center (x, y) of all detected faces."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+    faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
+    
+    if len(faces) == 0:
+        return 0.5, 0.5 # Default to center
+        
+    # Calculate the average center of all faces found
+    avg_x = sum([x + w/2 for (x, y, w, h) in faces]) / len(faces)
+    avg_y = sum([y + h/2 for (x, y, w, h) in faces]) / len(faces)
+    
+    img_h, img_w = frame_bgr.shape[:2]
+    return avg_x / img_w, avg_y / img_h
+    
 # =========================
 # SCENE DETECTION
 # =========================
 
 def detect_scenes(video):
+    """
+    Detect scene cuts by diffing sampled grayscale frames.
+
+    Previously hardcoded idx%6 and threshold=22 meant behaviour changed
+    completely with source framerate — at 120fps it sampled every 0.05s
+    (4× too fast) producing many false cuts from minor motion/flicker.
+
+    Now uses SCENE_SAMPLE_FPS (default 5) to compute sample_interval from
+    actual source fps, so we always diff ~5 times/second regardless of
+    whether the source is 24, 30, 60, or 120fps.
+
+    Config constants (processing.scene_detection in editor.config.json):
+      SCENE_SAMPLE_FPS       — target samples per second (default 5.0)
+      SCENE_DIFF_THRESHOLD   — mean pixel diff to trigger a cut (default 22.0)
+      SCENE_MIN_DURATION_SEC — discard scenes shorter than this (default 1.0)
+    """
     cap   = cv2.VideoCapture(video)
-    fps   = cap.get(cv2.CAP_PROP_FPS)
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Derive sample interval from actual fps so behaviour is framerate-agnostic.
+    # e.g. 30fps / 5 samples/s = check every 6th frame
+    #      120fps / 5 samples/s = check every 24th frame  (was every 6th — 4× too fast)
+    sample_interval = max(1, int(fps / SCENE_SAMPLE_FPS))
 
     prev  = None
     idx   = 0
@@ -64,11 +119,11 @@ def detect_scenes(video):
         if not ok:
             break
 
-        if idx % 6 == 0:
+        if idx % sample_interval == 0:
             g = cv2.cvtColor(frm, cv2.COLOR_BGR2GRAY)
             if prev is not None:
                 diff = np.mean(cv2.absdiff(g, prev))
-                if diff > 22:
+                if diff > SCENE_DIFF_THRESHOLD:
                     cuts.append(idx)
             prev = g
 
@@ -79,21 +134,20 @@ def detect_scenes(video):
     cap.release()
     cuts.append(total)
 
+    min_frames = fps * SCENE_MIN_DURATION_SEC
     scenes = []
     for i, (a, b) in enumerate(zip(cuts[:-1], cuts[1:]), 1):
-        if b - a > fps:
+        if b - a > min_frames:
             scenes.append({"id": i, "start": a / fps, "end": b / fps})
 
+    print(f"   sample_interval={sample_interval} frames  "
+          f"({fps:.0f}fps ÷ {SCENE_SAMPLE_FPS} samples/s)  "
+          f"diff_threshold={SCENE_DIFF_THRESHOLD}")
     return fps, scenes
 
 # =========================
 # SCENE ANALYSIS — motion centroid + saliency fallback
 # =========================
-
-# Minimum mean pixel difference across a scene to be considered "animated".
-# Below this the scene is treated as static (title card, frozen slide, etc.)
-# and saliency is used instead of motion.
-MOTION_THRESHOLD = 8.0
 
 def _motion_center(gray_frames: list) -> tuple:
     """
@@ -114,9 +168,9 @@ def _motion_center(gray_frames: list) -> tuple:
         diff = cv2.absdiff(gray_frames[i], gray_frames[i - 1])
         energies.append(float(diff.mean()))
 
-        _, mask = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(diff, MOTION_PIXEL_THRESHOLD, 255, cv2.THRESH_BINARY)
 
-        # Optional: dilate slightly to merge nearby changed regions into blobs
+        # Dilate slightly to merge nearby changed regions into blobs
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask   = cv2.dilate(mask, kernel, iterations=1)
 
@@ -134,6 +188,26 @@ def _motion_center(gray_frames: list) -> tuple:
         float(np.mean(energies)),
     )
 
+def _face_center(frame_bgr: np.ndarray) -> tuple:
+    """
+    Expert Refinement: Filters out small, likely-false detections (text/icons).
+    """
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+    
+    # Increase minNeighbors to 8 to reduce 'hallucinated' faces on slides
+    faces = face_cascade.detectMultiScale(gray, 1.1, 8, minSize=(120, 120))
+    
+    if len(faces) == 0:
+        return None
+        
+    # Pick the largest face (most likely the subject)
+    largest_face = max(faces, key=lambda rect: rect[2] * rect[3])
+    x, y, w, h = largest_face
+    
+    img_h, img_w = frame_bgr.shape[:2]
+    return (x + w/2) / img_w, (y + h/2) / img_h
 
 def _saliency_center(frame_bgr: np.ndarray) -> tuple:
     """
@@ -158,142 +232,127 @@ def _saliency_center(frame_bgr: np.ndarray) -> tuple:
 
     return 0.5, 0.5
 
-
-def analyze_scene(video_path: str, scene_start: float, scene_end: float,
-                  sample_fps: float = 2.0) -> dict:
+def analyze_scene(video_path: str, scene_start: float, scene_end: float) -> dict:
     """
-    Sample frames from [scene_start, scene_end], apply the 95% pre-crop, then
-    determine the best portrait crop center using a 3-tier strategy:
-
-      Tier 1 — Motion centroid
-        Diffs consecutive samples to find where animation is happening.
-        Best signal for animated explainer content where drawn elements
-        move into frame, grow, highlight, etc.
-        Used when mean motion energy > MOTION_THRESHOLD.
-
-      Tier 2 — Spectral saliency
-        Finds the most visually prominent region of the middle frame.
-        Used when the scene is mostly static (title card, frozen slide).
-
-      Tier 3 — Geometric center fallback
-        Pure center crop. Used when both above signals are flat or fail.
-
-    Returns a dict:
-      src_w, src_h  — original video dimensions (pre-crop)
-      cx_frac       — crop center X as fraction of pre-cropped width  (0-1)
-      cy_frac       — crop center Y as fraction of pre-cropped height (0-1)
-      strategy      — "motion" | "saliency" | "center"
-      motion_energy — mean pixel diff energy (diagnostic)
+    Tiered strategy: Face Detection -> Motion -> Saliency -> Center
     """
-    # NOTE: video_path is the PRE-CROPPED intermediate — no manual crop needed.
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    frame_interval = max(1, int(fps / sample_fps))
+    frame_interval = max(1, int(fps / ANALYSIS_SAMPLE_FPS))
     start_frame    = int(scene_start * fps)
     end_frame      = int(scene_end   * fps)
+    mid_frame      = start_frame + (end_frame - start_frame) // 2
 
     gray_frames   = []
     middle_region = None
 
-    mid_frame = start_frame + (end_frame - start_frame) // 2
-
+    # Sample frames for analysis
     for fi in range(start_frame, end_frame, frame_interval):
         cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
         ok, frame = cap.read()
-        if not ok:
-            break
-
-        # Frame is already pre-cropped — read it directly
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray_frames.append(gray)
-
-        if middle_region is None or abs(fi - mid_frame) < abs(fi - mid_frame - frame_interval):
+        if not ok: break
+        
+        gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        if middle_region is None or abs(fi - mid_frame) < frame_interval:
             middle_region = frame.copy()
 
     cap.release()
 
-    if not gray_frames:
-        return {"src_w": src_w, "src_h": src_h,
-                "cx_frac": 0.5, "cy_frac": 0.5,
-                "strategy": "center", "motion_energy": 0.0}
+    # ── Tier 0: Face Detection ───────────────────────────────────────
+    if FACE_DETECTION_ENABLED and middle_region is not None:
+        face_res = _face_center(middle_region)
+        if face_res:
+            cx, cy = face_res
+            return {"src_w": src_w, "src_h": src_h, "cx_frac": cx, "cy_frac": cy,
+                    "strategy": "face", "motion_energy": 0.0}
 
-    # ── Tier 1: motion ───────────────────────────────────────────────
+    # ── Tier 1: Motion (Existing) ────────────────────────────────────
     if len(gray_frames) >= 2:
         cx, cy, energy = _motion_center(gray_frames)
         if energy >= MOTION_THRESHOLD:
-            return {"src_w": src_w, "src_h": src_h,
-                    "cx_frac": cx, "cy_frac": cy,
+            return {"src_w": src_w, "src_h": src_h, "cx_frac": cx, "cy_frac": cy,
                     "strategy": "motion", "motion_energy": energy}
     else:
         energy = 0.0
 
-    # ── Tier 2: saliency ─────────────────────────────────────────────
+    # ── Tier 2: Saliency (Existing) ──────────────────────────────────
     if middle_region is not None:
         cx, cy = _saliency_center(middle_region)
-        # Only trust saliency if it produced a non-trivial result
-        # (i.e. not just snapping to dead center, which means it found nothing)
-        if not (0.48 < cx < 0.52 and 0.48 < cy < 0.52):
-            return {"src_w": src_w, "src_h": src_h,
-                    "cx_frac": cx, "cy_frac": cy,
+        if not (0.5 - SALIENCY_CENTER_DEADBAND < cx < 0.5 + SALIENCY_CENTER_DEADBAND):
+            return {"src_w": src_w, "src_h": src_h, "cx_frac": cx, "cy_frac": cy,
                     "strategy": "saliency", "motion_energy": energy}
 
-    # ── Tier 3: center fallback ──────────────────────────────────────
-    return {"src_w": src_w, "src_h": src_h,
-            "cx_frac": 0.5, "cy_frac": 0.5,
+    # ── Tier 3: Center Fallback ──────────────────────────────────────
+    return {"src_w": src_w, "src_h": src_h, "cx_frac": 0.5, "cy_frac": 0.5,
             "strategy": "center", "motion_energy": energy}
 
-
-def build_portrait_filter(info: dict, scene_duration: float = 0.0):
+def analyze_scene_dynamic(video_path, start_s, end_s):
     """
-    Build the ffmpeg -filter_complex chain for the MAIN pan/motion portion of
-    a scene.
-
-    Returns: (filter_str, crop_x_end)
-      filter_str  — the complete filter_complex string
-      crop_x_end  — the horizontal crop-left pixel position at end of clip,
-                    used by build_zoomout_filter to start the zoom from the
-                    correct position so there is no visual jump.
+    Expert Refinement: Only counts a 'Face' if it is large enough to be a human.
     """
-    src_w    = info["src_w"]
-    src_h    = info["src_h"]
-    cx_frac  = info["cx_frac"]
-    strategy = info["strategy"]
-    energy   = info.get("motion_energy", 0.0)
-
-    port_h = src_h
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    path = []
+    for t in np.arange(start_s, end_s, 0.5):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
+        ret, frame = cap.read()
+        if not ret: break
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        
+        # minSize ensures we don't count tiny text-artifacts as faces
+        # 0.15 * height is a good threshold for a person in a video
+        min_dim = int(img_h * 0.15)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 6, minSize=(min_dim, min_dim))
+        
+        for (x, y, w, h) in faces:
+            path.append({"t": t - start_s, "x": (x + w/2) / frame.shape[1], "y": (y + h/2) / img_h})
+    
+    cap.release()
+    return path
+    
+def build_portrait_filter(info: dict, scene_duration: float, strategy_type: str):
+    """
+    Expert Refinement: Generates dynamic FFmpeg crop expressions.
+    - Slides: Slow Pan 0 -> max_range to keep static content engaging.
+    - Action/Face: Anchors the 9:16 window to the identified subject center.
+    """
+    src_w = info["src_w"]
+    src_h = info["src_h"]
     port_w = int(src_h * 9 / 16)
-
+    pan_range = max(0, src_w - port_w)
+    
+    # ── Background Blur (Standard Pipeline) ──────────────────────────
     bg = (
         f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
         f"crop={OUT_W}:{OUT_H},"
-        f"boxblur=luma_radius=40:luma_power=3"
+        f"boxblur=luma_radius={BLUR_LUMA_RADIUS}:luma_power={BLUR_LUMA_POWER}"
     )
 
-    if strategy == "motion":
-        desired_cx = int(cx_frac * src_w)
-        crop_x     = max(0, min(src_w - port_w, desired_cx - port_w // 2))
-        fg         = f"crop={port_w}:{port_h}:{crop_x}:0,scale={OUT_W}:{OUT_H}"
-        crop_x_end = crop_x
-        print(f"   📐 strategy=motion   energy={energy:.1f}  "
-              f"cx={cx_frac:.2f}  window=[{crop_x}:{crop_x+port_w}]/{src_w}px")
+    # ── Foreground Logic ─────────────────────────────────────────────
+    if strategy_type == "slides":
+        # Professional Ken Burns effect: Pan across the slide
+        # t = current timestamp in the filter, duration = scene length
+        x_expr = f"({pan_range}*t/{scene_duration})"
+        crop_x_end = pan_range
+        print(f"   🎥 Strategy: SLIDE (Panning 0 -> {pan_range}px)")
     else:
-        pan_range = max(0, src_w - port_w)
-        if pan_range > 0 and scene_duration > 0:
-            x_expr = f"{pan_range:.4f}*t/{scene_duration:.4f}"
-            fg     = f"crop={port_w}:{port_h}:{x_expr}:0,scale={OUT_W}:{OUT_H}"
-            crop_x_end = pan_range   # pan ends at the right edge
-            print(f"   📐 strategy={strategy} (pan)  "
-                  f"energy={energy:.1f}  range=0→{pan_range}px  dur={scene_duration:.1f}s")
-        else:
-            crop_x     = max(0, (src_w - port_w) // 2)
-            fg         = f"crop={port_w}:{port_h}:{crop_x}:0,scale={OUT_W}:{OUT_H}"
-            crop_x_end = crop_x
-            print(f"   📐 strategy={strategy} (center-fixed)  "
-                  f"energy={energy:.1f}  crop_x={crop_x}")
+        # Real-world: Anchor the 1080px window to the detected center
+        target_cx = info["cx_frac"] * src_w
+        static_x = max(0, min(src_w - port_w, int(target_cx - port_w // 2)))
+        x_expr = str(static_x)
+        crop_x_end = static_x
+        print(f"   👤 Strategy: ACTION/FACE (Anchored x={static_x}px)")
 
+    fg = f"crop={port_w}:{src_h}:{x_expr}:0,scale={OUT_W}:{OUT_H}"
+    
     filt = (
         f"[0:v]split[bg_src][fg_src];"
         f"[bg_src]{bg}[blurbg];"
@@ -301,7 +360,6 @@ def build_portrait_filter(info: dict, scene_duration: float = 0.0):
         f"[blurbg][portrait]overlay=0:0[out]"
     )
     return filt, crop_x_end
-
 
 def _composite_frame(content_crop: np.ndarray, full_frame: np.ndarray) -> np.ndarray:
     """
@@ -324,7 +382,7 @@ def _composite_frame(content_crop: np.ndarray, full_frame: np.ndarray) -> np.nda
     """
     # ── Background: full frame blurred to fill canvas ─────────────────
     bg = cv2.resize(full_frame, (OUT_W, OUT_H))
-    bg = cv2.GaussianBlur(bg, (81, 81), 0)
+    bg = cv2.GaussianBlur(bg, (BLUR_OPENCV_KSIZE, BLUR_OPENCV_KSIZE), 0)
 
     # ── Foreground: scale to fit, preserve aspect ratio ───────────────
     h, w = content_crop.shape[:2]
@@ -397,7 +455,7 @@ def render_zoomout_opencv(
 
     n_frames = max(1, int(zoom_duration * fps))
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    fourcc = cv2.VideoWriter_fourcc(*"avc1")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (OUT_W, OUT_H))
 
     for i in range(n_frames):
@@ -452,7 +510,26 @@ def _probe_dimensions(src: str) -> tuple:
     )
 
 
-def _precrop_offsets(src_w: int, src_h: int) -> tuple:
+def _detect_orientation(src_w: int, src_h: int) -> str:
+    """
+    Classify source video orientation based on aspect ratio.
+
+    Returns:
+      "portrait"  — H > W (e.g. 1080×1920, iPhone selfie/video)
+      "landscape" — W > H (e.g. 1920×1080, screen recording, camera wide)
+      "square"    — W == H
+
+    Implication for the pipeline:
+      landscape → full portrait conversion (crop window, pan, zoom-out)
+      portrait  → already correct shape; just trim + scale, no crop window needed
+      square    → treated as landscape (will be pillarboxed to portrait)
+    """
+    if src_h > src_w:
+        return "portrait"
+    elif src_w > src_h:
+        return "landscape"
+    else:
+        return "square"
     """
     Compute concrete pixel values for the pre-crop step.
 
@@ -460,7 +537,7 @@ def _precrop_offsets(src_w: int, src_h: int) -> tuple:
     config values PC_W, PC_H, PC_H_ANCHOR, PC_V_ANCHOR, returning
     integer pixel values ready to embed in an ffmpeg crop filter.
 
-    Config keys (subtitle.config.json → "precrop"):
+    Config keys (editor.config.json → "precrop"):
       horizontal_keep_pct  — fraction of WIDTH  to retain  (0.0–1.0)
       vertical_keep_pct    — fraction of HEIGHT to retain  (0.0–1.0)
       horizontal_anchor    — where to anchor horizontally: left | center | right
@@ -517,39 +594,70 @@ def _precrop_offsets(src_w: int, src_h: int) -> tuple:
 
     return cw, ch, x0, y0
 
-
-def precrop_video(src: str, out_path: Path) -> Path:
+def _precrop_offsets(src_w, src_h):
     """
-    Step 0: probe the source video dimensions, compute concrete pixel
-    crop values from config, and save a clean intermediate file used
-    by all downstream steps.
-
-    Config (subtitle.config.json → "precrop"):
-      horizontal_keep_pct  — fraction of WIDTH  to keep  (e.g. 0.95)
-      vertical_keep_pct    — fraction of HEIGHT to keep  (e.g. 0.85)
-      horizontal_anchor    — left | center | right
-      vertical_anchor      — top  | middle | bottom
-
-    Anchor grid:
-      top-left      top-center      top-right
-      middle-left   middle-center   middle-right
-      bottom-left   bottom-center   bottom-right
-
-    Dimensions are probed live from the source video via ffprobe so
-    the crop values are always exact integers, not runtime expressions.
-
-    Cached: delete the _precrop.mp4 to force re-crop with new settings.
+    Compute concrete pixel values for the pre-crop step.
     """
-    if out_path.exists():
-        print(f"⏭️  Pre-crop exists, reusing: {out_path.name}")
-        print(f"   (delete it to re-crop with updated settings)")
-        return out_path
+    valid_h = {"left", "center", "right"}
+    valid_v = {"top", "middle", "bottom"}
 
+    if PC_H_ANCHOR not in valid_h:
+        raise ValueError(
+            f"Invalid horizontal_anchor '{PC_H_ANCHOR}'. "
+            f"Must be one of: {sorted(valid_h)}"
+        )
+    if PC_V_ANCHOR not in valid_v:
+        raise ValueError(
+            f"Invalid vertical_anchor '{PC_V_ANCHOR}'. "
+            f"Must be one of: {sorted(valid_v)}"
+        )
+
+    cw = int(src_w * PC_W)
+    ch = int(src_h * PC_H)
+
+    # ── Horizontal offset ────────────────────────────────────────────
+    if PC_H_ANCHOR == "left":
+        x0 = 0
+    elif PC_H_ANCHOR == "right":
+        x0 = src_w - cw
+    else:   # center
+        x0 = (src_w - cw) // 2
+
+    # ── Vertical offset ──────────────────────────────────────────────
+    if PC_V_ANCHOR == "top":
+        y0 = 0
+    elif PC_V_ANCHOR == "bottom":
+        y0 = src_h - ch
+    else:   # middle
+        y0 = (src_h - ch) // 2
+
+    return cw, ch, x0, y0
+
+def precrop_video(src: str, out_path: Path) -> tuple:
+    """
+    Step 0: probe source dimensions, detect orientation, apply border-trim crop,
+    save a clean intermediate used by all downstream steps.
+
+    Returns (out_path, orientation) where orientation is "portrait" | "landscape" | "square".
+
+    Orientation drives the split strategy:
+      landscape → portrait conversion (crop window + pan + zoom-out)
+      portrait  → already vertical; just trim borders, then scale in split
+
+    Cached: delete _precrop.mp4 to force re-crop with new settings.
+    """
     src_w, src_h = _probe_dimensions(str(src))
+    orientation  = _detect_orientation(src_w, src_h)
+
+    if out_path.exists():
+        print(f"⏭️  Pre-crop exists, reusing: {out_path.name}  [{orientation}]")
+        print(f"   (delete it to re-crop with updated settings)")
+        return out_path, orientation
+
     cw, ch, x0, y0 = _precrop_offsets(src_w, src_h)
     vf = f"crop={cw}:{ch}:{x0}:{y0}"
 
-    print(f"✂️  Step 0: pre-cropping")
+    print(f"✂️  Step 0: pre-cropping  [{orientation} source]")
     print(f"   source    : {src_w}×{src_h} px")
     print(f"   h_anchor  : {PC_H_ANCHOR}   keep {PC_W*100:.0f}% → {cw}px wide"
           f"   x0={x0}  x1={x0+cw}  (trim L:{x0} R:{src_w-x0-cw})")
@@ -562,12 +670,12 @@ def precrop_video(src: str, out_path: Path) -> Path:
         "ffmpeg", "-y",
         "-i", str(src),
         "-vf", vf,
-        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_PRECROP),
         "-c:a", "copy",
         str(out_path),
     ])
     print(f"   ✅ Saved: {out_path}")
-    return out_path
+    return out_path, orientation
 
 # =========================
 # SPLIT VIDEO
@@ -583,117 +691,144 @@ def _ffmpeg_encode(src, ss, duration, filt, out):
         "-filter_complex", filt,
         "-map", "[out]",
         "-map", "0:a?",
-        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k",
+        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+        "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
         str(out),
     ])
 
 
-def split_video(video, scenes, out_dir):
+def _split_portrait(video, scenes, out_dir):
     """
-    For each scene:
-      1. Analyse for crop strategy (motion / saliency / center).
-      2. Encode MAIN clip  → pan or fixed crop, minus last frame and zoom duration.
-      3. Encode ZOOM clip  → zoom-out outro that reveals the full slide.
-      4. Concatenate MAIN + ZOOM → final scene file.
-      5. Clean up temp files.
+    Split path for portrait-source videos (e.g. iPhone selfie/video).
 
-    Drop-last-frame:
-      We subtract one frame duration (1/fps) from the end of every scene.
-      The last frame of a scene is typically a frozen or half-transitioned frame
-      that reads as an incomplete cut. Dropping it gives clean endings.
+    The source is already vertical — no portrait crop window needed.
+    We just trim each scene and scale to OUT_W×OUT_H.
 
-    Zoom-out outro:
-      The zoom clip animates crop_w from portrait-width → full-width over
-      ZOOM_OUT_DURATION seconds. crop_x simultaneously contracts back to 0.
-      Rendered via OpenCV — avoids ffmpeg crop w/h expression limitation.
+    No pan animation, no zoom-out outro — those are landscape-specific effects
+    that make no sense on talking-head or portrait-shot content.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Read fps from the pre-cropped video (needed for frame-drop calculation)
-    cap = cv2.VideoCapture(str(video))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    cap.release()
-    frame_dur = 1.0 / fps
-
-    print("🔎 Analysing scenes for crop…")
+    print("   📱 Portrait source — using direct trim+scale (no crop window)")
     for s in tqdm(scenes, desc="🎬 Splitting"):
         out = out_dir / f"scene_{s['id']:02d}.mp4"
         if out.exists():
             continue
 
-        scene_start    = s["start"]
-        scene_end      = s["end"]
-        raw_duration   = scene_end - scene_start
+        start    = s["start"]
+        duration = s["end"] - s["start"]
 
-        # Effective duration after dropping the last frame
-        eff_end        = scene_end - frame_dur
-        eff_duration   = eff_end - scene_start
+        run([
+            "ffmpeg", "-y",
+            "-ss", f"{start:.6f}",
+            "-t",  f"{duration:.6f}",
+            "-i",  str(video),
+            "-vf", f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
+                   f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264",
+            "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+            "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
+            str(out),
+        ])
 
-        # Cap zoom duration at 30% of the scene so short clips aren't all outro
-        zoom_dur       = min(ZOOM_OUT_DURATION, eff_duration * 0.30)
-        main_duration  = eff_duration - zoom_dur
+def split_video(video, scenes, out_dir, orientation: str = "landscape"):
+    """
+    Refined Splitter: Automatically detects Slides vs. Real-World content
+    and applies the appropriate camera behavior for vertical conversion.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-        info           = analyze_scene(video, scene_start, scene_end)
-        main_filt, crop_x_end = build_portrait_filter(info, scene_duration=main_duration)
+    if orientation == "portrait":
+        _split_portrait(video, scenes, out_dir)
+        return
 
-        tmp_main   = out_dir / f"_tmp_main_{s['id']:02d}.mp4"
-        tmp_zoom   = out_dir / f"_tmp_zoom_{s['id']:02d}.mp4"
+    cap = cv2.VideoCapture(str(video))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    frame_dur = 1.0 / fps
+
+    for s in tqdm(scenes, desc="🎬 Splitting"):
+        out = out_dir / f"scene_{s['id']:02d}.mp4"
+        if out.exists(): continue
+
+        scene_start, scene_end = s["start"], s["end"]
+        eff_duration = scene_end - scene_start
+        
+        # Determine zoom vs main duration based on config
+        zoom_dur = min(ZOOM_OUT_DURATION, eff_duration * ZOOM_OUT_MAX_PCT) if ZOOM_OUT_ENABLED else 0.0
+        main_duration = eff_duration - zoom_dur
+
+        # ── Step 1: Multi-Tier Content Analysis ─────────────────────
+        # 1. Face Tracking path
+        path_data = analyze_scene_dynamic(video, scene_start, scene_end)
+        # 2. Motion/Saliency path
+        tier_info = analyze_scene(video, scene_start, scene_end)
+        
+        # ── Step 2: Behavior Selection (The Group vs. Slide Logic) ──
+        energy = tier_info.get("motion_energy", 0.0)
+        face_points = path_data
+        
+        # Calculate how 'spread out' the detections are
+        if len(face_points) > 1:
+            x_coords = [p['x'] for p in face_points]
+            # Spread = difference between furthest left and right 'face'
+            spread = max(x_coords) - min(x_coords)
+        else:
+            spread = 0
+
+        # Expert Decision Logic:
+        # 1. If energy is ultra-low (0.14) -> Slide.
+        # 2. If face count is massive (>10) but they don't move -> Slide.
+        # 3. If faces are grouped (spread < 0.5) -> Group Video.
+        
+        is_slide = (energy < MOTION_THRESHOLD) and (len(face_points) == 0 or len(face_points) > 10)
+        
+        if len(face_points) > 0 and len(face_points) <= 10:
+            strategy_type = "action" # Trust the group tracking
+        elif is_slide:
+            strategy_type = "slides" # Trigger the Ken Burns Pan
+        else:
+            strategy_type = "action" # Fallback to motion/saliency
+
+        print(f"   🔍 Diagnostic: Energy={energy:.2f}, Detections={len(face_points)}, Spread={spread:.2f}")
+        
+        
+        # ── Step 3: Call Updated Filter Builder ─────────────────────
+        # This matches the new 3-argument signature defined above
+        main_filt, crop_x_end = build_portrait_filter(tier_info, main_duration, strategy_type)
+
+        tmp_main = out_dir / f"_tmp_main_{s['id']:02d}.mp4"
+        tmp_zoom = out_dir / f"_tmp_zoom_{s['id']:02d}.mp4"
         concat_txt = out_dir / f"_tmp_concat_{s['id']:02d}.txt"
 
         try:
-            # ── Clip A: main pan / motion (ffmpeg) ────────────────────
+            # ── Clip A: Main behavior (Pan or Anchor) ───────────────
             _ffmpeg_encode(video, scene_start, main_duration, main_filt, tmp_main)
 
-            # ── Clip B: zoom-out outro (OpenCV — avoids ffmpeg crop
-            #    w/h expression limitation) ────────────────────────────
-            zoom_start = scene_start + main_duration
-            render_zoomout_opencv(
-                video, scene_start, scene_end, zoom_dur, info, crop_x_end, tmp_zoom
-            )
+            if zoom_dur > 0:
+                # ── Clip B: Zoom-out (Starts from final pan/anchor x) ─
+                render_zoomout_opencv(video, scene_start, scene_end, zoom_dur, tier_info, int(crop_x_end), tmp_zoom)
 
-            # ── Re-encode zoom clip so codec matches main clip ─────────
-            # OpenCV writes mp4v — a quick ffmpeg pass normalises to h264.
-            #
-            # Option A: carry REAL audio for the zoom window instead of
-            # silence (-an). Two inputs:
-            #   [0] tmp_zoom  — video from OpenCV
-            #   [1] source video at zoom_start — audio only
-            # This means speech that falls inside the zoom window is audible,
-            # so sentences are never silently cut off mid-word.
-            tmp_zoom_enc = out_dir / f"_tmp_zoom_enc_{s['id']:02d}.mp4"
-            run([
-                "ffmpeg", "-y",
-                "-i", str(tmp_zoom),            # input 0: opencv video
-                "-ss", f"{zoom_start:.6f}",     # input 1: audio from source
-                "-t",  f"{zoom_dur:.6f}",
-                "-i",  str(video),
-                "-map", "0:v",                  # video  ← opencv frames
-                "-map", "1:a?",                 # audio  ← source (? = ok if none)
-                "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                "-c:a", "aac", "-b:a", "192k",
-                str(tmp_zoom_enc),
-            ])
+                # Standard h264 re-encode for concat compatibility
+                tmp_zoom_enc = out_dir / f"_tmp_zoom_enc_{s['id']:02d}.mp4"
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", str(tmp_zoom), "-ss", f"{scene_start + main_duration:.6f}",
+                    "-t", f"{zoom_dur:.6f}", "-i", str(video), "-map", "0:v", "-map", "1:a?",
+                    "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+                    "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR, str(tmp_zoom_enc)
+                ], check=True, capture_output=True)
 
-            # ── Concat A + B ──────────────────────────────────────────
-            with open(concat_txt, "w", encoding="utf8") as cf:
-                cf.write(f"file '{tmp_main.resolve().as_posix()}'\n")
-                cf.write(f"file '{tmp_zoom_enc.resolve().as_posix()}'\n")
+                with open(concat_txt, "w") as cf:
+                    cf.write(f"file '{tmp_main.resolve().as_posix()}'\n")
+                    cf.write(f"file '{tmp_zoom_enc.resolve().as_posix()}'\n")
 
-            run([
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(concat_txt),
-                "-c", "copy",
-                str(out),
-            ])
-
+                subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c", "copy", str(out)], check=True)
+            else:
+                tmp_main.replace(out)
         finally:
-            for f in (tmp_main, tmp_zoom,
-                      out_dir / f"_tmp_zoom_enc_{s['id']:02d}.mp4",
-                      concat_txt):
-                if f.exists():
-                    f.unlink()
+            # Cleanup intermediate files
+            for f in [tmp_main, tmp_zoom, out_dir / f"_tmp_zoom_enc_{s['id']:02d}.mp4", concat_txt]:
+                if f and Path(f).exists(): Path(f).unlink()
 
 
 # =========================
@@ -804,11 +939,75 @@ def snap_scenes_to_words(scenes: list, words: list,
 # ASS FILE WRITING
 # =========================
 
-def _ass_header(f, inact_c: str):
+# =========================
+# SUBTITLE PRESETS
+# =========================
+
+from config import SUBTITLE_PRESET
+
+def get_subtitle_style():
+    presets = {
+
+        "classic": {
+            "font_name": "Inter SemiBold",
+            "size": 72,
+            "color": "#FFFFFF",
+            "outline": 2,
+            "shadow": 1,
+            "uppercase": False
+        },
+
+        "loud_clear": {
+            "font_name": "Montserrat ExtraBold",
+            "size": 92,
+            "color": "#FFFFFF",
+            "outline": 4,
+            "shadow": 0,
+            "uppercase": True
+        },
+
+        "hype_mode": {
+            "font_name": "Anton",
+            "size": 105,
+            "color": "#FF0000",
+            "outline": 6,
+            "shadow": 0,
+            "uppercase": True
+        },
+
+        "vlog_pop": {
+            "font_name": "Poppins Bold",
+            "size": 82,
+            "color": "#00CFFF",
+            "outline": 3,
+            "shadow": 1,
+            "uppercase": False
+        },
+
+        "talk_show": {
+            "font_name": "Roboto Bold",
+            "size": 78,
+            "color": "#FFFFFF",
+            "outline": 0,
+            "shadow": 3,
+            "uppercase": False
+        }
+    }
+
+    return presets.get(SUBTITLE_PRESET, presets["classic"])
+
+def _ass_header(f):
+    style = get_subtitle_style()
+
+    font_name = style["font_name"]
+    font_size = style["size"]
+    color     = ass_color(style["color"])
+    outline   = style["outline"]
+    shadow    = style["shadow"]
+
     f.write(
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        "Collisions: Normal\n"
         f"PlayResX: {OUT_W}\n"
         f"PlayResY: {OUT_H}\n\n"
 
@@ -818,87 +1017,82 @@ def _ass_header(f, inact_c: str):
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
 
-        f"Style: Base,{FONT},{FONT_SIZE},"
-        f"{inact_c},{inact_c},&H00000000&,&H00000000&,"
+        f"Style: Base,{font_name},{font_size},"
+        f"{color},{color},&H00000000&,&H00000000&,"
         f"0,0,0,0,100,100,0,0,"
-        f"1,0,0,"
-        f"{ALIGNMENT},{MARGIN_H},{MARGIN_H},{MARGIN_V},1\n\n"
+        f"1,{outline},{shadow},"
+        f"2,{MARGIN_H},{MARGIN_H},{MARGIN_V},1\n\n"
 
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
+def render_karaoke_chunk(f, chunk):
+    """
+    Karaoke word-by-word highlight renderer.
+
+    Emits one dialogue event per word. Each event:
+      - spans word[i].start → word[i+1].start (last word: end + extend)
+      - shows ALL words in the chunk
+      - active word:   \1c<active_color> + optional pill background (\3c + \bord)
+      - inactive words: \1c<preset_base_color>  (reset after active word)
+
+    Active colour  = highlight.text_color  in editor.config.json  (e.g. #FFD700)
+    Inactive colour= preset style["color"]                         (e.g. #FFFFFF)
+    Pill background= highlight.background_color + opacity + padding when HL_ENABLED
+    """
+    style    = get_subtitle_style()
+    inact_c  = ass_color(style["color"])
+    act_c    = ass_color(ACTIVE_COLOR)
+    bg_alpha = opacity_to_alpha(BG_OPACITY)
+    bg_c     = ass_color(BG_COLOR, alpha=bg_alpha)
+
+    # Build ASS override tags using string concatenation — NOT f-strings.
+    # f-strings cause backslash escaping confusion:
+    #   \1  in f-string source = Python octal SOH (0x01)   — wrong
+    #   \\1 in f-string source = double backslash + 1      — also wrong
+    # Concatenation: "\\1c" in source = one backslash + "1c" in memory, unambiguously.
+    if HL_ENABLED:
+        open_tag  = "{" + "\\1c" + act_c + "\\3c" + bg_c + "\\bord" + str(BG_BORD) + "\\blur0}"
+    else:
+        open_tag  = "{" + "\\1c" + act_c + "}"
+    close_tag = "{" + "\\1c" + inact_c + "\\bord2\\blur0}"
+
+    for i, word in enumerate(chunk):
+        ev_start = word["s"]
+        ev_end   = chunk[i + 1]["s"] if i + 1 < len(chunk) else word["e"] + EXTEND_LAST_WORD_SEC
+
+        parts = []
+        for j, w in enumerate(chunk):
+            raw = w["w"]
+            if style["uppercase"]:
+                raw = raw.upper()
+
+            if j == i:
+                parts.append(open_tag + raw + close_tag)
+            else:
+                parts.append(raw)
+
+        text = " ".join(parts)
+        f.write(f"Dialogue:0,{ts(ev_start)},{ts(ev_end)},Base,,0,0,0,,{text}\n")
+
+
 def write_ass(path, scene_words):
     """
-    Single-layer karaoke rendering.
+    Write an ASS subtitle file for a scene using karaoke word-by-word highlight.
 
-    WHY we dropped the two-layer approach:
-      Layer 0 (plain text) and Layer 1 (highlight overlay) each contain the
-      full chunk text. libass lays out every dialogue event independently, so
-      when Layer 1 has invisible words interspersed the rendered line width
-      differs from Layer 0 — libass then places the two lines at different
-      horizontal positions, producing the double-text / offset subtitle bug.
-
-    NEW APPROACH — one event per word, single layer:
-      • Each event covers from this word's start → next word's start
-        (last word in chunk covers to chunk_end). This means subtitles
-        are always visible with no gaps between words.
-      • ALL words are rendered in every event, so the line width is always
-        identical and libass always positions the line in the same place.
-      • The active word gets highlight colour + background box.
-      • Inactive words get the inactive colour with no border.
-      • Result: one coherent subtitle line, correct position, no duplication.
+    subtitle_preset  → controls font, size, outline, uppercase, base (inactive) colour
+    highlight.text_color → active word colour (overrides preset per word via \1c tag)
+    highlight.background_color / opacity → pill behind active word when enabled
     """
-    inact_c    = ass_color(INACTIVE_COLOR)
-    act_c      = ass_color(ACTIVE_COLOR)
-    bg_alpha   = opacity_to_alpha(BG_OPACITY)
-    bg_c       = ass_color(BG_COLOR, alpha=bg_alpha)
-    extend     = EXTEND_LAST_WORD_SEC
-    hl_enabled = HL_ENABLED
-
     with open(path, "w", encoding="utf8") as f:
-        _ass_header(f, inact_c)
+        _ass_header(f)
+
+        if not scene_words:
+            return
 
         for chunk in chunk_words(scene_words):
-            if not chunk:
-                continue
-
-            chunk_end = chunk[-1]["e"] + extend
-
-            if not hl_enabled:
-                # No highlight — single static event for the whole chunk
-                base_text = " ".join(w["w"] for w in chunk)
-                f.write(
-                    f"Dialogue:0,{ts(chunk[0]['s'])},{ts(chunk_end)},"
-                    f"Base,,0,0,0,,{base_text}\n"
-                )
-                continue
-
-            # One event per word — each lasts from this word start → next word start
-            for i, active_w in enumerate(chunk):
-                word_start = active_w["s"]
-                # Hold until next word begins (seamless), or chunk end for last word
-                word_end   = chunk[i + 1]["s"] if i + 1 < len(chunk) else chunk_end
-
-                parts = []
-                for j, w in enumerate(chunk):
-                    if j == i:
-                        # Active word: highlight colour + background pill box
-                        # \3c  = outline/border colour  → becomes the pill fill
-                        # \bord = border thickness      → pill size
-                        parts.append(
-                            f"{{\1c{act_c}\3c{bg_c}\bord{BG_BORD}\blur0}}{w['w']}"
-                        )
-                    else:
-                        # Inactive word: plain colour, no border
-                        parts.append(
-                            f"{{\1c{inact_c}\bord0}}{w['w']}"
-                        )
-
-                f.write(
-                    f"Dialogue:0,{ts(word_start)},{ts(word_end)},"
-                    f"Base,,0,0,0,,{' '.join(parts)}\n"
-                )
+            render_karaoke_chunk(f, chunk)
 
 # =========================
 # LOGO + BURN
@@ -915,7 +1109,7 @@ def _build_logo_filter(ass_escaped: str, logo_path: str) -> tuple:
       CLI  → what files to process  (video, logo)
       Config → how to render them   (size, position, opacity)
 
-    Config keys (subtitle.config.json → "logo"):
+    Config keys (editor.config.json → "logo"):
       enabled      — bool, set false to skip logo without changing your command
       corner       — top-left | top-right | bottom-left | bottom-right
       width_pct    — logo width as fraction of output frame (e.g. 0.12)
@@ -966,7 +1160,7 @@ def _build_logo_filter(ass_escaped: str, logo_path: str) -> tuple:
     logo_path_esc = str(Path(logo_path).resolve()).replace("\\", "/").replace(":", "\\:")
 
     filter_complex = (
-        f"[0:v]subtitles='{ass_escaped}'[subbed];"
+        f"[0:v]subtitles='{ass_escaped}':fontsdir='{FONTS_DIR}'[subbed];"
         f"[1:v]scale={logo_w}:-1[logo_scaled];"
         f"[subbed][logo_scaled]overlay={ox}:{oy}:format=auto,"
         f"colorchannelmixer=aa={opacity:.3f}[out]"
@@ -1006,8 +1200,8 @@ def burn(src, ass, out, logo_path: str = "", force: bool = False):
             "-filter_complex", filter_complex,
             "-map", map_out,
             "-map", "0:a?",
-            "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+            "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
             str(out),
         ])
     else:
@@ -1015,9 +1209,9 @@ def burn(src, ass, out, logo_path: str = "", force: bool = False):
         run([
             "ffmpeg", "-y",
             "-i", str(src),
-            "-vf", f"subtitles='{ass_escaped}'",
-            "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k",
+            "-vf", f"subtitles='{ass_escaped}':fontsdir='{FONTS_DIR}'",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+            "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
             str(out),
         ])
 
@@ -1049,7 +1243,7 @@ Common workflows:
   Fix wrong transcription (edit words.json then):
     python process.py video.mp4 logo.png --regen-subs --force-burn
 
-  Change subtitle formatting only (edit subtitle.config.json then):
+  Change subtitle formatting only (edit editor.config.json then):
     python process.py video.mp4 logo.png --regen-subs --force-burn
 
   Change logo / burn settings only:
@@ -1085,7 +1279,8 @@ Common workflows:
     print(f"    logo     → {args.logo}")
 
     # ── Step 0: Pre-crop ─────────────────────────────────────────────
-    precrop_video(args.video, precropped)
+    precropped, orientation = precrop_video(args.video, precropped)
+    print(f"   orientation: {orientation}")
 
     # ── Step 1: Scene detection ──────────────────────────────────────
     if not meta.exists():
@@ -1098,7 +1293,8 @@ Common workflows:
             src_for_detection
         ]))
         json.dump(
-            {"video": str(precropped), "fps": fps, "duration": duration, "scenes": scenes},
+            {"video": str(precropped), "fps": fps, "duration": duration,
+             "orientation": orientation, "scenes": scenes},
             open(meta, "w", encoding="utf8"),
             indent=2,
         )
@@ -1106,28 +1302,26 @@ Common workflows:
     else:
         print(f"   📖 Loaded scenes from cache ({meta.name})")
 
-    data   = json.load(open(meta, encoding="utf8"))
-    scenes = data["scenes"]
+    data        = json.load(open(meta, encoding="utf8"))
+    scenes      = data["scenes"]
+    orientation = data.get("orientation", orientation)
 
     # ── Step 2: Transcribe ───────────────────────────────────────────
-    # --regen-words  → re-run Whisper even if words.json exists
-    # default        → load from words.json if present, skip if not
-    if args.regen_words:
+    if args.regen_words or not words_cache.exists():
         print("🧠  Transcribing with Whisper…")
         model = whisper.load_model("base")
         src_for_whisper = str(precropped) if precropped.exists() else args.video
         res   = model.transcribe(src_for_whisper, word_timestamps=True)
         del model
         gc.collect()
+
         words = [w for seg in res["segments"] for w in seg["words"]]
         json.dump(words, open(words_cache, "w", encoding="utf8"), indent=2)
         print(f"   💾 {len(words)} words → {words_cache.name}")
-    elif words_cache.exists():
+
+    else:
         words = json.load(open(words_cache, encoding="utf8"))
         print(f"   📖 Loaded {len(words)} words from cache ({words_cache.name})")
-    else:
-        words = []
-        print("   ⚠️  No words.json — run with --regen-words to transcribe")
 
     # ── Step 3: Snap scene boundaries to word ends ───────────────────
     # Runs automatically whenever words are available and splits haven't
@@ -1146,7 +1340,7 @@ Common workflows:
         for f in scenes_dir.glob("scene_*.mp4"):
             f.unlink()
 
-    split_video(str(precropped), scenes, scenes_dir)
+    split_video(str(precropped), scenes, scenes_dir, orientation=orientation)
 
     # ── Step 5: Generate subtitle ASS files ──────────────────────────
     # --regen-subs → force-regenerate all ASS from words.json

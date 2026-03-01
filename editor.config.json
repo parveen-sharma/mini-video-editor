@@ -2,7 +2,7 @@
   "//": "==============================",
   "enabled": true,
   "//layout": "karaoke | static | sentence",
-  "mode": "sentence",
+  "mode": "karaoke",
   "//max_words_per_line": "Controls line breaking before wrapping",
   "max_words_per_line": 4,
   "//max_lines": "Total lines visible at once (2 = 2x2 layout)",
@@ -10,7 +10,7 @@
   "//word_visibility": "all | active-only",
   "word_visibility": "all",
   "//hold_previous_words": "Keeps past words visible until sentence ends",
-  "hold_previous_words": true,
+  "hold_previous_words": false,
   "//pause_aware": "If true, subtitles stay on screen during short pauses",
   "pause_aware": true,
   "//pause_threshold_ms": "Pause duration considered a break",
@@ -25,15 +25,7 @@
   "line_spacing_px": 12,
   "//word_spacing_px": "Horizontal spacing between words",
   "word_spacing_px": 8,
-  "font": {
-    "family": "Arial",
-    "size": 60,
-    "weight": "bold",
-    "//inactive_word_color": "Color for non-highlighted words",
-    "inactive_color": "#FFFFFF",
-    "//inactive_opacity": "0\u20131",
-    "inactive_opacity": 0.85
-  },
+  "subtitle_preset": "loud_clear", 
   "highlight": {
     "enabled": true,
     "//highlight_mode": "word | syllable",
@@ -85,5 +77,53 @@
     "margin_y": 30,
     "//opacity": "0.0 = invisible, 1.0 = fully opaque",
     "opacity": 0.85
+  },
+  "processing": {
+    "//": "Tuning knobs for all pipeline steps. Changing these requires --regen-splits.",
+    "scene_detection": {
+      "//sample_fps": "How many times per second to sample frames for cut detection. Framerate-agnostic \u2014 10 samples/s works for 30fps and 120fps equally.",
+      "sample_fps": 10.0,
+      "//diff_threshold": "Mean pixel diff (0-255) between samples to trigger a scene cut. Lower = more sensitive. Default 22 works for most content.",
+      "diff_threshold": 22.0,
+      "//min_duration_sec": "Discard detected scenes shorter than this. Filters out flash cuts.",
+      "min_duration_sec": 1.0
+    },
+    "motion_analysis": {
+      "//motion_threshold": "Mean pixel energy above which a scene is classified as animated (uses motion centroid). Below this, saliency is tried.",
+      "motion_threshold": 15.0,
+      "//sample_fps": "Frames per second to sample when analysing crop center.",
+      "sample_fps": 20.0,
+      "//pixel_diff_threshold": "Per-pixel diff (0-255) to count a pixel as moving during motion analysis.",
+      "pixel_diff_threshold": 100,
+      "//saliency_center_deadband": "If saliency returns a point within this fraction of dead-center, it is rejected and center fallback is used instead.",
+      "saliency_center_deadband": 0.0
+    },
+    "background_blur": {
+      "//": "Blur applied to the background fill behind the portrait crop window (landscape sources only).",
+      "ffmpeg_luma_radius": 40,
+      "ffmpeg_luma_power": 3,
+      "//opencv_kernel_size": "Must be odd. Increase for a heavier blur.",
+      "opencv_kernel_size": 81
+    },
+    "zoom_out": {
+      "//": "Zoom-out outro appended to each scene (landscape sources only). Disabled automatically for portrait sources.",
+      "//enabled": "Set false to disable entirely for all scenes.",
+      "enabled": false,
+      "//max_pct_of_scene": "Cap zoom duration as a fraction of scene length. Prevents short scenes from being mostly zoom.",
+      "max_pct_of_scene": 0.1
+    },
+    "encode": {
+      "//crf_precrop": "CRF quality for the pre-crop intermediate (Step 0). Lower = better quality, larger file.",
+      "crf_precrop": 16,
+      "//crf_scenes": "CRF quality for split scenes and final burns.",
+      "crf_scenes": 18,
+      "//audio_bitrate": "AAC audio bitrate for all encoded outputs.",
+      "audio_bitrate": "192k",
+      "//preset": "ffmpeg encode speed preset. fast=good balance. slower=smaller files. ultrafast=fastest.",
+      "preset": "fast"
+    },
+	"face_detection": {
+      "enabled": true
+    }
   }
 }
