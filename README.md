@@ -223,11 +223,12 @@ Upload-ready.
 ```
 mini-video-editor/
 ├── process.py              ← main script
+├── batch_process.py        ← batch processing script - use this to process all video files in a folder 
 ├── config.py
-├── editor.config.json      ← all tuning knobs (font, colour, crop, logo…)
+├── editor.config.json      ← all tuning knobs (font, colour, crop, logo…) - edit this file
 ├── fonts/
-├── videos/
-│   └── MyVideo.mp4
+├── videos/                 ← folder that contains videos to be processed
+│   └── MyVideo.mp4         ← specific video can be processed, or complete folder for processing
 ├── logo.png                ← logo (PNG with transparency recommended)
 └── output/
     └── MyVideo/
@@ -242,6 +243,19 @@ mini-video-editor/
             └── scene_01.mp4 …     ← finished clips with subtitles + logo
 ```
 
+---
+
+# 🤝 Quick Start Commands
+
+Processing: Single File
+```bash
+python process.py video.mp4 logo.png
+```
+
+Processing: Folder (with multiple files)
+```bash
+ python batch_process.py videos/subfolder01 "logo.png"
+```
 
 ---
 
