@@ -128,12 +128,6 @@ Defined in `process.py`
 
 ![Image](https://simplified.co/siteimages/video-editor/subtitle-styles.png)
 
-![Image](https://async.com/blog/content/images/2025/02/Choose-the-style.webp)
-
-![Image](https://blitzcutai.com/_next/image?q=75\&url=%2Fblog%2Fcaption-fonts-tiktok.png\&w=3840)
-
-![Image](https://www.notta.ai/pictures/how-to-add-subtitles-on-tiktok-cover.png)
-
 Active word highlight:
 
 * Custom color
