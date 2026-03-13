@@ -12,11 +12,11 @@
   "//hold_previous_words": "Keeps past words visible until sentence ends",
   "hold_previous_words": false,
   "//pause_aware": "If true, subtitles stay on screen during short pauses",
-  "pause_aware": true,
+  "pause_aware": false,
   "//pause_threshold_ms": "Pause duration considered a break",
   "pause_threshold_ms": 400,
   "//alignment": "bottom_center | center | top_center",
-  "alignment": "bottom_center",
+  "alignment": "center",
   "//margin_vertical_px": "Distance from bottom/top depending on alignment",
   "margin_vertical_px": 200,
   "//margin_horizontal_px": "Left/right safe margin",
@@ -25,7 +25,7 @@
   "line_spacing_px": 12,
   "//word_spacing_px": "Horizontal spacing between words",
   "word_spacing_px": 8,
-  "subtitle_preset": "loud_clear", 
+  "subtitle_preset": "vlog_pop",
   "highlight": {
     "enabled": true,
     "//highlight_mode": "word | syllable",
@@ -82,7 +82,7 @@
     "//": "Tuning knobs for all pipeline steps. Changing these requires --regen-splits.",
     "scene_detection": {
       "//sample_fps": "How many times per second to sample frames for cut detection. Framerate-agnostic \u2014 10 samples/s works for 30fps and 120fps equally.",
-      "sample_fps": 10.0,
+      "sample_fps": 6.0,
       "//diff_threshold": "Mean pixel diff (0-255) between samples to trigger a scene cut. Lower = more sensitive. Default 22 works for most content.",
       "diff_threshold": 22.0,
       "//min_duration_sec": "Discard detected scenes shorter than this. Filters out flash cuts.",
@@ -108,7 +108,7 @@
     "zoom_out": {
       "//": "Zoom-out outro appended to each scene (landscape sources only). Disabled automatically for portrait sources.",
       "//enabled": "Set false to disable entirely for all scenes.",
-      "enabled": false,
+      "enabled": true,
       "//max_pct_of_scene": "Cap zoom duration as a fraction of scene length. Prevents short scenes from being mostly zoom.",
       "max_pct_of_scene": 0.1
     },
@@ -122,8 +122,14 @@
       "//preset": "ffmpeg encode speed preset. fast=good balance. slower=smaller files. ultrafast=fastest.",
       "preset": "fast"
     },
-	"face_detection": {
+    "face_detection": {
       "enabled": true
     }
+  },
+  "precrop": {
+    "horizontal_keep_pct": 0.95,
+    "vertical_keep_pct": 0.9,
+    "horizontal_anchor": "center",
+    "vertical_anchor": "top"
   }
 }

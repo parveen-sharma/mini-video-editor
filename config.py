@@ -52,6 +52,9 @@ def _clamp(val: float, lo: float, hi: float, name: str) -> float:
 # FONT & SUBTITLE
 # =========================
 
+# =========================
+# FONT & SUBTITLE
+# =========================
 _require(CFG, "highlight", "max_words_per_line", "max_lines",
          "margin_horizontal_px", "margin_vertical_px",
          "extend_last_word_ms", "pause_threshold_ms",
@@ -59,9 +62,17 @@ _require(CFG, "highlight", "max_words_per_line", "max_lines",
 
 MAX_WORDS_PER_LINE = int(CFG["max_words_per_line"])
 MAX_LINES          = int(CFG["max_lines"])
-
 MARGIN_H           = int(CFG["margin_horizontal_px"])
 MARGIN_V           = int(CFG["margin_vertical_px"])
+
+# --- DYNAMIC ALIGNMENT FIX ---
+_raw_align = str(CFG.get("alignment", "bottom_center")).lower()
+align_lookup = {
+    "bottom_center": 2,
+    "center": 5,
+    "top_center": 8
+}
+ALIGNMENT = align_lookup.get(_raw_align, 2) # Default to 2 if something goes wrong
 
 ACTIVE_COLOR       = str(CFG["highlight"]["text_color"])
 
@@ -104,7 +115,7 @@ OUT_W, OUT_H = 1080, 1920
 #   "anchor": "vertical-horizontal"  string is parsed as a fallback.
 
 _pc     = CFG.get("precrop", {})
-PC_W    = _clamp(float(_pc.get("horizontal_keep_pct", 0.84)), 0.1, 1.0,
+PC_W    = _clamp(float(_pc.get("horizontal_keep_pct", 0.88)), 0.1, 1.0,
                  "precrop.horizontal_keep_pct")
 PC_H    = _clamp(float(_pc.get("vertical_keep_pct",   0.84)), 0.1, 1.0,
                  "precrop.vertical_keep_pct")

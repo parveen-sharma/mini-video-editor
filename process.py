@@ -3,6 +3,13 @@ from pathlib import Path
 from tqdm import tqdm
 import whisper, cv2, numpy as np
 
+import sys
+import io
+
+# EXPERT FIX: Force UTF-8 encoding for Windows Console to prevent UnicodeEncodeError
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
 from config import (
     CFG, LOGO_CFG,
     MAX_WORDS_PER_LINE, MAX_LINES,
@@ -454,8 +461,9 @@ def render_zoomout_opencv(
     cap.release()
 
     n_frames = max(1, int(zoom_duration * fps))
-
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    
+    # fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (OUT_W, OUT_H))
 
     for i in range(n_frames):
@@ -1021,8 +1029,7 @@ def _ass_header(f):
         f"{color},{color},&H00000000&,&H00000000&,"
         f"0,0,0,0,100,100,0,0,"
         f"1,{outline},{shadow},"
-        f"2,{MARGIN_H},{MARGIN_H},{MARGIN_V},1\n\n"
-
+        f"{ALIGNMENT},{MARGIN_H},{MARGIN_H},{MARGIN_V},1\n\n" # Use dynamic ALIGNMENT here
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
