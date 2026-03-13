@@ -958,7 +958,7 @@ def get_subtitle_style():
 
         "classic": {
             "font_name": "Inter SemiBold",
-            "size": 72,
+            "size": 92,
             "color": "#FFFFFF",
             "outline": 2,
             "shadow": 1,
@@ -985,7 +985,7 @@ def get_subtitle_style():
 
         "vlog_pop": {
             "font_name": "Poppins Bold",
-            "size": 82,
+            "size": 92,
             "color": "#00CFFF",
             "outline": 3,
             "shadow": 1,
@@ -994,9 +994,9 @@ def get_subtitle_style():
 
         "talk_show": {
             "font_name": "Roboto Bold",
-            "size": 78,
+            "size": 92,
             "color": "#FFFFFF",
-            "outline": 0,
+            "outline": 2,
             "shadow": 3,
             "uppercase": False
         }

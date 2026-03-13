@@ -1,4 +1,46 @@
 # 🎬 Mini Video Editor
+# 🎥 AI Video Reframer Pro
+
+### Automated Horizontal → Vertical Shorts Pipeline with Smart Intelligence
+
+AI Video Reframer Pro is a high-performance suite designed to transform landscape videos into viral 9:16 vertical content. It features a tiered intelligence system (Face -> Motion -> Saliency) and a professional Streamlit dashboard for real-time configuration.
+
+---
+
+## ✨ Key Features
+
+* **🖥️ Pro Dashboard:** A unified UI to manage subtitles, AI thresholds, and framing.
+* **📱 Live Subtitle Preview:** Visualize alignment, margins, and colors in a virtual 9:16 frame before rendering.
+* **📁 Native OS Pickers:** Integrated Windows File/Folder explorers for a seamless workflow.
+* **👤 Multi-Tier Tracking:** 1. **Face Tracking:** Centers the speaker automatically.
+    2. **Motion Analysis:** Follows action if no faces are present.
+    3. **Saliency Mapping:** Identifies prominent objects (diagrams/slides).
+* **🎞️ Smart Pan (Ken Burns):** Automatically detects static slides and applies cinematic pans.
+* **🔤 Karaoke Subtitles:** High-impact, word-level highlights with 5 pro presets.
+* **⚙️ 7-Stage Pipeline:** Fully incremental—only runs the steps you change.
+
+---
+
+## 🧠 System Architecture
+
+1.  **Step 0: Pre-Crop:** Trims edges to remove static watermarks or black bars.
+2.  **Step 1: Scene Detection:** Diff-based analysis to find natural cuts.
+3.  **Step 2: Transcription:** AI-powered word-level timestamps via OpenAI Whisper.
+4.  **Step 3: Boundary Snapping:** Aligns visual cuts with the end of spoken words to prevent audio glitches.
+5.  **Step 4: Portrait Conversion:** Applies cropping, tracking, and optional OpenCV zoom-out.
+6.  **Step 5: ASS Generation:** Builds advanced subtitle files based on UI presets.
+7.  **Step 6: Burn & Overlay:** Final FFmpeg render combining video, subtitles, and logo.
+
+---
+
+## 🚀 Getting Started
+
+### Installation
+1. Install Python 3.10+ and FFmpeg.
+2. Clone this repository.
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
 
 ### AI-Powered Horizontal → Vertical Shorts Generator
 

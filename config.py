@@ -65,15 +65,6 @@ MAX_LINES          = int(CFG["max_lines"])
 MARGIN_H           = int(CFG["margin_horizontal_px"])
 MARGIN_V           = int(CFG["margin_vertical_px"])
 
-# --- DYNAMIC ALIGNMENT FIX ---
-_raw_align = str(CFG.get("alignment", "bottom_center")).lower()
-align_lookup = {
-    "bottom_center": 2,
-    "center": 5,
-    "top_center": 8
-}
-ALIGNMENT = align_lookup.get(_raw_align, 2) # Default to 2 if something goes wrong
-
 ACTIVE_COLOR       = str(CFG["highlight"]["text_color"])
 
 BG_COLOR           = str(CFG["highlight"]["background_color"])
@@ -87,7 +78,16 @@ HL_ENABLED         = bool(CFG["highlight"].get("enabled", True))
 EXTEND_LAST_WORD_SEC = float(CFG["extend_last_word_ms"]) / 1000.0
 PAUSE_THRESHOLD_SEC  = float(CFG.get("pause_threshold_ms", 400)) / 1000.0
 
-ALIGNMENT          = 8      # bottom-center (ASS standard)
+# --- DYNAMIC ALIGNMENT FIX ---
+_raw_align = str(CFG.get("alignment", "bottom_center")).lower()
+align_lookup = {
+    "bottom_center": 2,
+    "center": 5,
+    "top_center": 8
+}
+ALIGNMENT = align_lookup.get(_raw_align, 2) # Default to 2 if something goes wrong
+
+# ALIGNMENT          = 8      # bottom-center (ASS standard)
 BG_BORD            = PAD_Y + 6
 
 # =========================
