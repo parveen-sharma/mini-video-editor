@@ -16,7 +16,7 @@
   "//pause_threshold_ms": "Pause duration considered a break",
   "pause_threshold_ms": 400,
   "//alignment": "bottom_center | center | top_center",
-  "alignment": "center",
+  "alignment": "top_center",
   "//margin_vertical_px": "Distance from bottom/top depending on alignment",
   "margin_vertical_px": 150,
   "//margin_horizontal_px": "Left/right safe margin",
