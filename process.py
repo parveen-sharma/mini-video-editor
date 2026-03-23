@@ -10,6 +10,8 @@ import io
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
+import shutil
+
 from config import (
     CFG, LOGO_CFG,
     MAX_WORDS_PER_LINE, MAX_LINES,
@@ -27,8 +29,16 @@ from config import (
     BLUR_LUMA_RADIUS, BLUR_LUMA_POWER, BLUR_OPENCV_KSIZE,
     ZOOM_OUT_ENABLED, ZOOM_OUT_MAX_PCT,
     ENCODE_CRF_PRECROP, ENCODE_CRF_SCENES, ENCODE_AUDIO_BR, ENCODE_PRESET,
+    ENCODE_AUDIO_TAIL_TRIM_MS, ENCODE_AUDIO_FADEOUT_MS, ENCODE_ACCURATE_SEEK,
     FACE_DETECTION_ENABLED,
     SUBTITLE_PRESET,
+    SPLIT_MODE, SPLIT_TRANSITION_TYPE, SPLIT_HAS_NARRATION,
+    SPLIT_MIN_WORD_CONFIDENCE, SPLIT_MIN_CLIP_SEC, SPLIT_MAX_CLIP_SEC,
+    SPLIT_PAUSE_THRESHOLD_SEC, SPLIT_MERGE_MIN_SEC, SPLIT_MAX_CLIPS,
+    SPLIT_VISUAL_CUT_SNAP_TOLERANCE_SEC, SPLIT_VISUAL_CUT_MIN_ENERGY,
+    WHISPER_MODEL, WHISPER_LANGUAGE,
+    SUBTITLES_ENABLED,
+    PRESET_NAME, FONT_SCALE, IS_PORTRAIT_OUTPUT,
 )
 
 # =========================
@@ -244,6 +254,123 @@ def merge_short_scenes(scenes, min_duration=20):
 
 
 # =========================
+# SPEECH-PRIMARY SPLIT
+# =========================
+
+def speech_primary_split(
+    words: list,
+    visual_scenes: list,
+    min_dur: float,
+    max_dur: float,
+    pause_thresh: float,
+    snap_tolerance: float,
+) -> list:
+    """
+    Speech-first splitting with visual cuts as optional refinement.
+
+    Strategy:
+      1. Split by speech across the FULL video — no visual walls.
+      2. For each internal speech boundary, check if a visual cut falls
+         within snap_tolerance seconds.
+      3. If one does, snap the boundary to the nearest word END within
+         that tolerance window.
+      4. If no word end is close enough, leave the speech boundary as-is.
+         Never breaks mid-word.
+
+    This means speech rhythm is always respected; visual cuts are a soft
+    hint that can sharpen an already-natural pause into a cleaner cut.
+    """
+    scenes = split_by_speech(words, min_dur=min_dur, max_dur=max_dur, pause_thresh=pause_thresh)
+    if not scenes or len(scenes) < 2:
+        return scenes
+
+    word_ends    = sorted(w["end"] for w in words)
+    visual_cuts  = sorted(vs["start"] for vs in visual_scenes if vs.get("start", 0) > 0)
+
+    if not visual_cuts:
+        return scenes
+
+    snapped = [dict(s) for s in scenes]
+
+    for i in range(len(snapped) - 1):
+        boundary = snapped[i]["end"]
+
+        # Find the closest visual cut within snap_tolerance
+        nearby = [vc for vc in visual_cuts if abs(vc - boundary) <= snap_tolerance]
+        if not nearby:
+            continue
+
+        closest_cut = min(nearby, key=lambda vc: abs(vc - boundary))
+
+        # Find nearest word end within tolerance of that visual cut
+        lo = closest_cut - snap_tolerance
+        hi = closest_cut + snap_tolerance
+        candidates = [t for t in word_ends if lo <= t <= hi]
+
+        if not candidates:
+            continue  # No word boundary near this visual cut — leave speech boundary
+
+        best = min(candidates, key=lambda t: abs(t - closest_cut))
+
+        if abs(best - boundary) > 0.05:  # skip no-ops
+            print(f"   📍 Snapped boundary {boundary:.2f}s → {best:.2f}s "
+                  f"(near visual cut at {closest_cut:.2f}s)")
+            snapped[i]["end"]       = best
+            snapped[i + 1]["start"] = best
+
+    for i, s in enumerate(snapped, 1):
+        s["id"] = i
+
+    return snapped
+
+
+# =========================
+# VISUAL DETECTION THRESHOLD
+# =========================
+
+def _effective_diff_threshold(transition_type: str) -> float:
+    """
+    Return the frame-diff threshold appropriate for the content transition type.
+
+    cut   → standard threshold — detects hard cuts reliably
+    fade  → 2× threshold — fade ramps are gradual; we only want very strong diffs
+    mixed → 1.5× threshold — middle ground
+    """
+    base = SCENE_DIFF_THRESHOLD
+    if transition_type == "fade":
+        return base * 2.0
+    elif transition_type == "mixed":
+        return base * 1.5
+    return base   # "cut" or unknown
+
+
+# =========================
+# ASS TIMESTAMP HELPERS (for clip merge)
+# =========================
+
+def _parse_ass_ts(ts_str: str) -> float:
+    """Parse ASS timestamp string H:MM:SS.cc → float seconds."""
+    ts_str = ts_str.strip()
+    h, m, s_cs = ts_str.split(":")
+    s, cs = s_cs.split(".")
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100.0
+
+
+def _offset_ass_dialogue(line: str, offset_sec: float) -> str:
+    """
+    Shift Start and End timestamps in an ASS Dialogue line by offset_sec.
+    Format: Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+    """
+    # Split on comma but limit to 9 splits so Text (which may contain commas) is preserved
+    parts = line.split(",", 9)
+    if len(parts) < 10:
+        return line
+    parts[1] = ts(_parse_ass_ts(parts[1]) + offset_sec)
+    parts[2] = ts(_parse_ass_ts(parts[2]) + offset_sec)
+    return ",".join(parts)
+
+
+# =========================
 # FONTS
 # =========================
 
@@ -307,15 +434,18 @@ def opacity_to_alpha(opacity: float) -> int:
 # SCENE DETECTION
 # =========================
 
-def detect_scenes(video):
+def detect_scenes(video, diff_threshold: float = None):
     """
     Detect scene cuts by diffing sampled grayscale frames.
 
-    Uses SCENE_SAMPLE_FPS to derive a framerate-agnostic sample interval,
-    so behaviour is consistent whether source is 24, 30, 60, or 120 fps.
+    Uses SCENE_SAMPLE_FPS to derive a framerate-agnostic sample interval.
+    diff_threshold overrides SCENE_DIFF_THRESHOLD when provided (used by
+    _effective_diff_threshold() to handle fade vs. cut transition types).
 
     Returns (fps, scenes) where fps is the actual source framerate.
     """
+    effective_threshold = diff_threshold if diff_threshold is not None else SCENE_DIFF_THRESHOLD
+
     cap   = cv2.VideoCapture(video)
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -337,7 +467,7 @@ def detect_scenes(video):
             g = cv2.cvtColor(frm, cv2.COLOR_BGR2GRAY)
             if prev is not None:
                 diff = np.mean(cv2.absdiff(g, prev))
-                if diff > SCENE_DIFF_THRESHOLD:
+                if diff > effective_threshold:
                     cuts.append(idx)
             prev = g
 
@@ -356,7 +486,8 @@ def detect_scenes(video):
 
     print(f"   sample_interval={sample_interval} frames  "
           f"({fps:.0f}fps ÷ {SCENE_SAMPLE_FPS} samples/s)  "
-          f"diff_threshold={SCENE_DIFF_THRESHOLD}")
+          f"diff_threshold={effective_threshold:.1f}"
+          f"{' (raised for ' + SPLIT_TRANSITION_TYPE + ')' if diff_threshold else ''}")
     return fps, scenes
 
 
@@ -785,58 +916,197 @@ def precrop_video(src: str, out_path: Path) -> tuple:
 # SPLIT VIDEO
 # =========================
 
+def _build_audio_filter(duration_sec: float) -> str:
+    """
+    Build an ffmpeg -af filter string that removes audio bleed at the clip end.
+
+    Two-stage approach:
+      1. atrim=end — hard-cuts audio at (duration - tail_trim), removing
+         AAC encoder look-ahead frames that bleed into the next sentence.
+      2. afade=out — short fade-out on the trimmed tail, masking any
+         residual bleed that survives the trim.
+
+    Returns an empty string when both values are zero (no filter applied).
+
+    Why audio bleeds at clip end:
+      The AAC encoder maintains an internal look-ahead buffer. When ffmpeg
+      flushes at -t, it pulls a few frames past the cut point to complete
+      encoding — those frames contain the start of the next sentence.
+      Trimming 100-200ms from the audio tail reliably removes this artefact
+      without any audible impact (the trim lands in the pause between sentences).
+    """
+    tail_trim_sec  = ENCODE_AUDIO_TAIL_TRIM_MS / 1000.0
+    fadeout_sec    = ENCODE_AUDIO_FADEOUT_MS   / 1000.0
+
+    if tail_trim_sec <= 0 and fadeout_sec <= 0:
+        return ""
+
+    parts = []
+
+    if tail_trim_sec > 0:
+        trimmed_end = max(0.0, duration_sec - tail_trim_sec)
+        parts.append(f"atrim=end={trimmed_end:.6f}")
+        parts.append("asetpts=PTS-STARTPTS")   # re-stamp PTS after trim
+
+    if fadeout_sec > 0:
+        # Fade start = end of trimmed audio minus fadeout duration.
+        # If tail_trim was applied, work from trimmed_end; else from duration.
+        audio_end = (trimmed_end if tail_trim_sec > 0 else duration_sec)
+        fade_start = max(0.0, audio_end - fadeout_sec)
+        parts.append(
+            f"afade=t=out:st={fade_start:.6f}:d={fadeout_sec:.6f}"
+        )
+
+    return ",".join(parts)
+
+
 def _ffmpeg_encode(src, ss, duration, filt, out):
-    """Single ffmpeg encode call with filter_complex. Used by split_video."""
-    run([
-        "ffmpeg", "-y",
-        "-ss", f"{ss:.6f}",
-        "-t",  f"{duration:.6f}",
-        "-i",  str(src),
-        "-filter_complex", filt,
-        "-map", "[out]",
-        "-map", "0:a?",
-        "-pix_fmt", "yuv420p", "-c:v", "libx264",
-        "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
-        "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
-        str(out),
-    ])
+    """
+    Single ffmpeg encode call with filter_complex. Used by split_video.
+
+    Seek strategy:
+      accurate_seek=false (default): -ss before -i (fast seek to nearest keyframe).
+        Fast but can start a few frames early — acceptable for most content.
+      accurate_seek=true: -ss after -i (slow/input seek). Decodes every frame
+        from the start to the target — sample-accurate but 2-4x slower.
+
+    Audio bleed fix:
+      _build_audio_filter() appends atrim+afade to the audio stream to remove
+      AAC look-ahead bleed at the clip tail.
+    """
+    audio_af = _build_audio_filter(duration)
+
+    if ENCODE_ACCURATE_SEEK:
+        # Slow seek: -ss after -i — frame-accurate, slower
+        cmd = [
+            "ffmpeg", "-y",
+            "-i",  str(src),
+            "-ss", f"{ss:.6f}",
+            "-t",  f"{duration:.6f}",
+            "-filter_complex", filt,
+            "-map", "[out]",
+            "-map", "0:a?",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264",
+            "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+            "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
+        ]
+    else:
+        # Fast seek: -ss before -i — keyframe-accurate, faster
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{ss:.6f}",
+            "-t",  f"{duration:.6f}",
+            "-i",  str(src),
+            "-filter_complex", filt,
+            "-map", "[out]",
+            "-map", "0:a?",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264",
+            "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+            "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
+        ]
+
+    if audio_af:
+        cmd += ["-af", audio_af]
+
+    cmd.append(str(out))
+    run(cmd)
 
 
 def _split_portrait(video, scenes, out_dir):
     """
     Portrait-source path: trim each scene and scale to OUT_W×OUT_H.
     No pan animation or zoom-out — those are landscape-only effects.
+    Audio bleed fix applied via _build_audio_filter().
     """
     print("   📱 Portrait source — using direct trim+scale (no crop window)")
     for s in tqdm(scenes, desc="🎬 Splitting"):
-        # FIX (critical): consistent scene filename — no hook suffix in scenes/
         out = out_dir / f"scene_{s['id']:02d}.mp4"
         if out.exists():
             continue
 
-        run([
-            "ffmpeg", "-y",
-            "-ss", f"{s['start']:.6f}",
-            "-t",  f"{s['end'] - s['start']:.6f}",
-            "-i",  str(video),
+        duration  = s["end"] - s["start"]
+        audio_af  = _build_audio_filter(duration)
+
+        cmd = ["ffmpeg", "-y"]
+
+        if ENCODE_ACCURATE_SEEK:
+            cmd += ["-i", str(video), "-ss", f"{s['start']:.6f}", "-t", f"{duration:.6f}"]
+        else:
+            cmd += ["-ss", f"{s['start']:.6f}", "-t", f"{duration:.6f}", "-i", str(video)]
+
+        cmd += [
             "-vf", f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
                    f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2",
             "-pix_fmt", "yuv420p", "-c:v", "libx264",
             "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
             "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
-            str(out),
-        ])
+        ]
+        if audio_af:
+            cmd += ["-af", audio_af]
+        cmd.append(str(out))
+        run(cmd)
+
+
+def _split_scale_to_fill(video, scenes, out_dir):
+    """
+    Scale-to-fill path for square and landscape output presets.
+    Each scene is scaled to fit OUT_W×OUT_H with a blurred background fill.
+    No portrait crop window, no pan animation — just reformat.
+    Audio bleed fix applied via _build_audio_filter().
+    """
+    print(f"   🖥️  {PRESET_NAME} output — scale-to-fill (no portrait crop)")
+    for s in tqdm(scenes, desc="🎬 Splitting"):
+        out = out_dir / f"scene_{s['id']:02d}.mp4"
+        if out.exists():
+            continue
+
+        duration = s["end"] - s["start"]
+        audio_af = _build_audio_filter(duration)
+
+        vf = (
+            f"split[bg][fg];"
+            f"[bg]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
+            f"crop={OUT_W}:{OUT_H},"
+            f"boxblur=luma_radius={BLUR_LUMA_RADIUS}:luma_power={BLUR_LUMA_POWER}[blurred];"
+            f"[fg]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
+            f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2[scaled];"
+            f"[blurred][scaled]overlay=0:0[out]"
+        )
+
+        cmd = ["ffmpeg", "-y"]
+
+        if ENCODE_ACCURATE_SEEK:
+            cmd += ["-i", str(video), "-ss", f"{s['start']:.6f}", "-t", f"{duration:.6f}"]
+        else:
+            cmd += ["-ss", f"{s['start']:.6f}", "-t", f"{duration:.6f}", "-i", str(video)]
+
+        cmd += [
+            "-filter_complex", vf,
+            "-map", "[out]", "-map", "0:a?",
+            "-pix_fmt", "yuv420p", "-c:v", "libx264",
+            "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+            "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
+        ]
+        if audio_af:
+            cmd += ["-af", audio_af]
+        cmd.append(str(out))
+        run(cmd)
 
 
 def split_video(video, scenes, out_dir, words, orientation: str = "landscape"):
     """
-    Convert each scene to a portrait clip.
-    FIX (critical): scene files are always named scene_NN.mp4 (no hook suffix).
-    Hooks belong only in the final/ directory — keeping scenes/ clean allows
-    the burn loop to reliably locate files by ID.
+    Convert each scene to the target output format.
+    Routes to portrait conversion or scale-to-fill depending on IS_PORTRAIT_OUTPUT.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Non-portrait presets (square, landscape_*): scale source to fill target
+    # dimensions with blurred background. No portrait crop window or pan.
+    if not IS_PORTRAIT_OUTPUT:
+        _split_scale_to_fill(video, scenes, out_dir)
+        return
+
+    # Portrait presets: existing orientation-aware path
     if orientation == "portrait":
         _split_portrait(video, scenes, out_dir)
         return
@@ -1018,9 +1288,8 @@ def snap_scenes_to_words(scenes: list, words: list, tolerance: float = 1.0) -> l
 def get_subtitle_style(detected_lang: str = "en") -> dict:
     """
     Return the subtitle style dict for the current preset.
-    FIX (high): language is now passed in as a parameter instead of being read
-    from globals(). This ensures correct font selection even when words are
-    loaded from cache (--regen-words not passed).
+    Font sizes are scaled by FONT_SCALE so they render correctly at any
+    output resolution — base sizes are calibrated for portrait_hd (1920px tall).
     """
     presets = {
         "classic": {
@@ -1067,6 +1336,9 @@ def get_subtitle_style(detected_lang: str = "en") -> dict:
 
     style = presets.get(SUBTITLE_PRESET, presets["classic"]).copy()
 
+    # Scale font size for output resolution
+    style["size"] = max(12, int(style["size"] * FONT_SCALE))
+
     NON_ENGLISH_FONT_MAP = {
         "hi": "Noto Sans Devanagari",
         "ar": "Noto Sans Arabic",
@@ -1079,7 +1351,8 @@ def get_subtitle_style(detected_lang: str = "en") -> dict:
     if lang != "en":
         style["font_name"] = NON_ENGLISH_FONT_MAP.get(lang, "Noto Sans")
 
-    print(f"🎨 Font selected: {style['font_name']} (lang={lang})")
+    print(f"🎨 Font: {style['font_name']}  size={style['size']}  "
+          f"(lang={lang}, preset={PRESET_NAME}, scale={FONT_SCALE:.2f})")
     return style
 
 
@@ -1090,10 +1363,14 @@ def get_subtitle_style(detected_lang: str = "en") -> dict:
 def _ass_header(f, detected_lang: str = "en"):
     style     = get_subtitle_style(detected_lang)
     font_name = style["font_name"]
-    font_size = style["size"]
+    font_size = style["size"]   # already scaled by FONT_SCALE
     color     = ass_color(style["color"])
     outline   = style["outline"]
     shadow    = style["shadow"]
+
+    # Scale margins for output resolution
+    margin_h = max(10, int(MARGIN_H * FONT_SCALE))
+    margin_v = max(10, int(MARGIN_V * FONT_SCALE))
 
     f.write(
         "[Script Info]\n"
@@ -1111,7 +1388,7 @@ def _ass_header(f, detected_lang: str = "en"):
         f"{color},{color},&H00000000&,&H00000000&,"
         f"0,0,0,0,100,100,0,0,"
         f"1,{outline},{shadow},"
-        f"{ALIGNMENT},{MARGIN_H},{MARGIN_H},{MARGIN_V},1\n\n"
+        f"{ALIGNMENT},{margin_h},{margin_h},{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -1216,8 +1493,46 @@ def _build_logo_filter(ass_escaped: str, logo_path: str) -> tuple:
 def burn(src, ass, out, logo_path: str = "", force: bool = False):
     """
     Burn subtitles (and optional logo) onto a scene clip.
+    ass may be None for visual_only clips with no narration — logo is still applied.
     """
     if out.exists() and not force:
+        return
+
+    logo_cfg = LOGO_CFG
+    logo_enabled = (
+        logo_cfg.get("enabled", False)
+        and logo_path
+        and Path(logo_path).exists()
+    )
+
+    # No subtitles case (visual_only with no narration)
+    if ass is None:
+        if logo_enabled:
+            corner    = str(logo_cfg.get("corner", "bottom-right")).lower()
+            width_pct = float(logo_cfg.get("width_pct", 0.12))
+            margin_x  = int(logo_cfg.get("margin_x", 30))
+            margin_y  = int(logo_cfg.get("margin_y", 30))
+            opacity   = float(logo_cfg.get("opacity", 1.0))
+            logo_w    = int(OUT_W * width_pct)
+            ox = f"W-w-{margin_x}" if "right"  in corner else str(margin_x)
+            oy = f"H-h-{margin_y}" if "bottom" in corner else str(margin_y)
+            run([
+                "ffmpeg", "-y",
+                "-i", str(src),
+                "-i", logo_path,
+                "-filter_complex",
+                f"[1:v]scale={logo_w}:-1[logo_scaled];"
+                f"[0:v][logo_scaled]overlay={ox}:{oy}:format=auto,"
+                f"colorchannelmixer=aa={opacity:.3f}[out]",
+                "-map", "[out]", "-map", "0:a?",
+                "-pix_fmt", "yuv420p", "-c:v", "libx264",
+                "-preset", ENCODE_PRESET, "-crf", str(ENCODE_CRF_SCENES),
+                "-c:a", "aac", "-b:a", ENCODE_AUDIO_BR,
+                str(out),
+            ])
+        else:
+            # Just copy the scene clip as the final (no subs, no logo)
+            run(["ffmpeg", "-y", "-i", str(src), "-c", "copy", str(out)])
         return
 
     ass_escaped = escape_ffmpeg_path(ass)
@@ -1249,6 +1564,141 @@ def burn(src, ass, out, logo_path: str = "", force: bool = False):
 
 
 # =========================
+# CLIP MERGE
+# =========================
+
+def merge_clips(base: Path, clip_ids: list, logo_path: str, lang: str):
+    """
+    Merge two or more scene clips into a single output clip.
+
+    Steps:
+      1. Concatenate scene_NN.mp4 files (ffmpeg concat demuxer — lossless copy).
+      2. Merge ASS subtitle files with cumulative timestamp offsets.
+      3. Re-burn merged video with merged subtitles + logo.
+      4. Write merge_NN_NN.json metadata.
+
+    Originals are untouched. No renumbering of existing clips.
+    Output naming: merge_03_04_05.mp4 / merge_03_04_05.json
+    """
+    scenes_dir = base / "scenes"
+    subs_dir   = base / "subtitles"
+    final_dir  = base / "final"
+    meta_file  = base / "scenes.json"
+
+    if not meta_file.exists():
+        raise FileNotFoundError(f"scenes.json not found at {meta_file}. Run the pipeline first.")
+
+    with open(meta_file, encoding="utf8") as f:
+        meta = json.load(f)
+
+    scenes_by_id = {s["id"]: s for s in meta.get("scenes", [])}
+
+    # Validate all requested IDs exist
+    missing_ids = [i for i in clip_ids if i not in scenes_by_id]
+    if missing_ids:
+        raise ValueError(f"Clip ID(s) not found in scenes.json: {missing_ids}. "
+                         f"Available IDs: {sorted(scenes_by_id.keys())}")
+
+    sorted_ids  = sorted(clip_ids)
+    id_str      = "_".join(f"{i:02d}" for i in sorted_ids)
+    merge_name  = f"merge_{id_str}"
+
+    print(f"\n🔗  Merging clips {sorted_ids} → {merge_name}")
+
+    # Validate all source files exist before starting
+    scene_paths, ass_paths = [], []
+    for cid in sorted_ids:
+        sp = scenes_dir / f"scene_{cid:02d}.mp4"
+        ap = subs_dir   / f"scene_{cid:02d}.ass"
+        if not sp.exists():
+            raise FileNotFoundError(f"Scene clip missing: {sp}\n"
+                                    f"Run the pipeline with --regen-splits first.")
+        if not ap.exists():
+            raise FileNotFoundError(f"Subtitle file missing: {ap}\n"
+                                    f"Run the pipeline with --regen-subs first.")
+        scene_paths.append(sp)
+        ass_paths.append(ap)
+
+    tmp_dir = base / "_tmp_merge"
+    tmp_dir.mkdir(exist_ok=True)
+
+    try:
+        # ── Step 1: Concatenate scene MP4s (stream copy — no re-encode) ──────
+        concat_txt = tmp_dir / "concat.txt"
+        with open(concat_txt, "w", encoding="utf-8") as cf:
+            for sp in scene_paths:
+                cf.write(f"file '{sp.resolve().as_posix()}'\n")
+
+        tmp_video = tmp_dir / f"{merge_name}.mp4"
+        print("   🎬 Concatenating scene clips…")
+        run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_txt),
+            "-c", "copy",
+            str(tmp_video),
+        ])
+
+        # ── Step 2: Merge ASS subtitle files with cumulative time offsets ─────
+        merged_ass  = tmp_dir / f"{merge_name}.ass"
+        cumulative  = 0.0
+
+        print("   📝 Merging subtitle files…")
+        with open(merged_ass, "w", encoding="utf8") as out_f:
+            header_written = False
+
+            for cid, ass_path in zip(sorted_ids, ass_paths):
+                scene_dur = scenes_by_id[cid]["end"] - scenes_by_id[cid]["start"]
+
+                with open(ass_path, encoding="utf8") as in_f:
+                    lines = in_f.readlines()
+
+                if not header_written:
+                    # Write full ASS header from the first file only
+                    for line in lines:
+                        out_f.write(line)
+                        if line.strip().startswith("Format:") and "Effect" in line:
+                            # We've just written the Events Format line — stop header
+                            break
+                    header_written = True
+                else:
+                    # For subsequent files, write only Dialogue lines (with offset)
+                    pass
+
+                # Write all Dialogue lines with cumulative offset applied
+                for line in lines:
+                    if line.startswith("Dialogue:"):
+                        out_f.write(_offset_ass_dialogue(line, cumulative))
+
+                cumulative += scene_dur
+
+        # ── Step 3: Re-burn with merged subtitles + logo ──────────────────────
+        final_path = final_dir / f"{merge_name}.mp4"
+        print("   🔥 Burning subtitles + logo onto merged clip…")
+        burn(tmp_video, merged_ass, final_path, logo_path=logo_path, force=True)
+
+        # ── Step 4: Write metadata JSON ───────────────────────────────────────
+        sorted_scenes = [scenes_by_id[cid] for cid in sorted_ids]
+        meta_out = final_dir / f"{merge_name}.json"
+        with open(meta_out, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "merged_clips": sorted_ids,
+                    "start":        sorted_scenes[0]["start"],
+                    "end":          sorted_scenes[-1]["end"],
+                    "duration":     sorted_scenes[-1]["end"] - sorted_scenes[0]["start"],
+                },
+                f,
+                indent=2,
+            )
+
+        print(f"   ✅  Merged clip → {final_path}")
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# =========================
 # MAIN
 # =========================
 
@@ -1257,16 +1707,26 @@ def main():
         description="Convert horizontal video to vertical shorts with karaoke subtitles.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Each step only runs if its output is missing. Use flags to force re-runs.
+Split modes (set in config or override with --split-mode):
+  speech_only    — Type 1: slides/voiceover. Splits purely on speech pauses.
+  visual_only    — Type 2: ambient/background audio. Splits on visual cuts.
+  speech_primary — Type 3: talking head + demo. Speech first, visual snaps.
+  hybrid         — Legacy: visual walls, speech subdivides within.
+  reformat_only  — No splitting. Whole video as one clip (reformat + subtitles).
 
-Steps and flags:
-  Step 0  pre-crop      runs if _precrop.mp4 missing; delete to re-crop
-  Step 1  transcribe    --regen-words   (re-runs Whisper, overwrites words.json)
-  Step 2  scene detect  runs if visual_scenes.json missing
-  Step 3  hybrid split  always re-derives from cached visual scenes + words
-  Step 4  split scenes  --regen-splits
-  Step 5  gen subtitles --regen-subs
-  Step 6  burn          --force-burn
+Output preset (set in config output.preset):
+  portrait_hd  — 1080x1920  TikTok / Reels / YouTube Shorts  (default)
+  portrait_sd  — 720x1280   Lighter portrait
+  square       — 1080x1080  Instagram feed
+  landscape_hd — 1920x1080  YouTube / LinkedIn
+  landscape_sd — 1280x720   Lighter YouTube
+
+Whisper model (set in config whisper.model):
+  tiny / base / small (default) / medium / large
+
+Clip merge:
+  python process.py video.mp4 logo.png --merge 3,4,5
+  Merges clips 3, 4 and 5 → final/merge_03_04_05.mp4
 
 Common workflows:
   First run:
@@ -1275,8 +1735,8 @@ Common workflows:
   Change subtitle style only:
     python process.py video.mp4 logo.png --regen-subs --force-burn
 
-  Change logo / burn settings only:
-    python process.py video.mp4 logo.png --force-burn
+  Override split mode for one file:
+    python process.py video.mp4 logo.png --split-mode speech_primary --regen-splits --force-burn
         """,
     )
     ap.add_argument("video", help="Path to the source video file")
@@ -1285,7 +1745,37 @@ Common workflows:
     ap.add_argument("--regen-subs",   action="store_true", help="Re-write ASS files from words.json")
     ap.add_argument("--regen-splits", action="store_true", help="Re-split and re-encode all scene files")
     ap.add_argument("--force-burn",   action="store_true", help="Re-burn final files even if they exist")
+    ap.add_argument(
+        "--split-mode",
+        default=None,
+        choices=["speech_only", "visual_only", "speech_primary", "hybrid", "reformat_only"],
+        help="Override the split_mode from config for this run only.",
+    )
+    ap.add_argument(
+        "--merge",
+        default=None,
+        metavar="IDS",
+        help="Comma-separated clip IDs to merge, e.g. --merge 3,4,5",
+    )
     args = ap.parse_args()
+
+    # -- Input validation
+    video_path = Path(args.video)
+    if video_path.is_dir():
+        ap.error(
+            "That path is a directory, not a video file: " + str(args.video) + "\n"
+            "  Pass a single video file. To process a folder use batch_process.py."
+        )
+    if not video_path.exists() and not args.merge:
+        ap.error("Video file not found: " + str(args.video))
+    valid_exts = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm"}
+    if video_path.exists() and video_path.suffix.lower() not in valid_exts:
+        print("Warning: " + video_path.suffix + " is an unusual extension - continuing but ffprobe may fail.")
+    if not Path(args.logo).exists():
+        print("Warning: logo not found: " + str(args.logo) + " - logo will be skipped.")
+
+    # Effective split mode: CLI flag overrides config
+    split_mode = (args.split_mode or SPLIT_MODE).lower()
 
     name        = Path(args.video).stem
     base        = Path("output") / name
@@ -1295,31 +1785,75 @@ Common workflows:
     meta        = base / "scenes.json"
     precropped  = base / f"{name}_precrop.mp4"
     words_cache = base / "words.json"
-    lang_cache  = base / "lang.txt"      # FIX (high): persist language separately
+    lang_cache  = base / "lang.txt"
 
     for d in (base, scenes_dir, subs_dir, final_dir):
         d.mkdir(parents=True, exist_ok=True)
 
+    # ── Handle --merge early (after directories are ready) ───────────────────
+    if args.merge:
+        try:
+            clip_ids = [int(x.strip()) for x in args.merge.split(",")]
+        except ValueError:
+            ap.error("--merge expects comma-separated integers, e.g. --merge 3,4,5")
+
+        # Load language from cache so subtitles render with the right font
+        lang = "en"
+        if lang_cache.exists():
+            with open(lang_cache, encoding="utf8") as f:
+                lang = f.read().strip() or "en"
+
+        merge_clips(base, clip_ids, args.logo, lang)
+        print("\n✅  Merge complete.")
+        return
+
     print(f"\n🎬  Processing: {args.video}")
-    print(f"    output   → {base}")
-    print(f"    logo     → {args.logo}")
+    print(f"    output      → {base}")
+    print(f"    logo        → {args.logo}")
+    print(f"    split_mode  → {split_mode}")
+    print(f"    output      → {PRESET_NAME}  ({OUT_W}×{OUT_H})")
+    print(f"    whisper     → {WHISPER_MODEL}"
+          f"  lang={'auto-detect' if WHISPER_LANGUAGE == 'auto' else WHISPER_LANGUAGE}")
+    print(f"    subtitles   → {'enabled' if SUBTITLES_ENABLED else 'DISABLED'}")
 
-    # ── Step 0: Pre-crop ──────────────────────────────────────────────
+    # ── Step 0: Pre-crop ─────────────────────────────────────────────────────
     precropped, orientation = precrop_video(args.video, precropped)
-    print(f"    orientation: {orientation}")
+    print(f"    orientation → {orientation}")
 
-    # ── Step 1: Transcribe ────────────────────────────────────────────
-    # FIX (critical): single Whisper call — language detected from the same
-    # res dict, not a separate full transcribe pass that was previously thrown away.
-    # FIX (high): language persisted to lang.txt so font selection is correct
-    # even on cache hits (when --regen-words is not passed).
-    if args.regen_words or not words_cache.exists():
-        print("🧠  Transcribing with Whisper…")
+    # ── Step 1: Transcribe ───────────────────────────────────────────────────
+    # Skip Whisper when: visual_only+no_narration OR subtitles disabled+reformat_only
+    skip_whisper = (
+        (split_mode == "visual_only" and not SPLIT_HAS_NARRATION)
+        or (split_mode == "reformat_only" and not SUBTITLES_ENABLED)
+    )
+
+    if skip_whisper:
+        reason = ("visual_only + has_narration=false"
+                  if split_mode == "visual_only"
+                  else "reformat_only + subtitles disabled")
+        print(f"⏭️  Skipping Whisper ({reason})")
+        words = []
+        lang  = "en"
+        if not words_cache.exists():
+            with open(words_cache, "w", encoding="utf8") as f:
+                json.dump([], f)
+        if not lang_cache.exists():
+            with open(lang_cache, "w", encoding="utf8") as f:
+                f.write("en")
+
+    elif args.regen_words or not words_cache.exists():
+        print(f"🧠  Transcribing with Whisper [{WHISPER_MODEL}]…")
         src_for_whisper = str(precropped) if precropped.exists() else args.video
-        model = whisper.load_model("medium")
+        model = whisper.load_model(WHISPER_MODEL)
 
-        res  = model.transcribe(src_for_whisper, word_timestamps=True)
-        lang = res.get("language", "en")
+        # Use configured language if known — skips Whisper's internal detection pass
+        transcribe_kwargs = {"word_timestamps": True}
+        if WHISPER_LANGUAGE != "auto":
+            transcribe_kwargs["language"] = WHISPER_LANGUAGE
+            print(f"   language    → {WHISPER_LANGUAGE} (from config)")
+
+        res  = model.transcribe(src_for_whisper, **transcribe_kwargs)
+        lang = res.get("language", WHISPER_LANGUAGE if WHISPER_LANGUAGE != "auto" else "en")
         print(f"   detected language: {lang}")
 
         del model
@@ -1327,17 +1861,14 @@ Common workflows:
 
         words = [w for seg in res["segments"] for w in seg["words"]]
 
-        # FIX (high): use context manager — no leaked file handles on Windows
         with open(words_cache, "w", encoding="utf8") as f:
             json.dump(words, f, indent=2)
         with open(lang_cache, "w", encoding="utf8") as f:
             f.write(lang)
 
         print(f"   💾 {len(words)} words → {words_cache.name}")
-        print(f"   💾 language '{lang}' → {lang_cache.name}")
 
     else:
-        # FIX (high): use context manager for cache load too
         with open(words_cache, encoding="utf8") as f:
             words = json.load(f)
 
@@ -1348,44 +1879,131 @@ Common workflows:
 
         print(f"   📖 Loaded {len(words)} words from cache  (lang={lang})")
 
-    # ── Step 2: Visual scene detection ────────────────────────────────
-    visual_cache = base / "visual_scenes.json"
+    # ── Step 2: Visual scene detection ───────────────────────────────────────
+    # speech_only: skip detect_scenes for splitting (it's not needed).
+    #   Crop analysis (analyze_scene) opens the video independently per scene.
+    # All other modes: run detect_scenes with threshold adjusted for transition type.
 
-    if visual_cache.exists() and not args.regen_splits:
-        with open(visual_cache, encoding="utf8") as f:
-            visual_scenes = json.load(f)
-        print(f"   📖 Loaded visual scenes from cache")
-    else:
-        # FIX (high): capture real fps from detect_scenes — no more hardcoded 25
-        print("🔍  Detecting visual scenes…")
-        source_fps, visual_scenes = detect_scenes(str(precropped))
-        with open(visual_cache, "w", encoding="utf8") as f:
-            json.dump(visual_scenes, f, indent=2)
-        print(f"   💾 {len(visual_scenes)} visual scenes → {visual_cache.name}")
+    visual_scenes = []
+    source_fps    = None
+    visual_cache  = base / "visual_scenes.json"
 
-    # ── Step 3: Hybrid scene splitting ────────────────────────────────
-    print("🧠  Creating hybrid scenes (visual + speech)…")
-    scenes = hybrid_split(words, visual_scenes, min_dur=35, max_dur=65, pause_thresh=1.1)
-    scenes = merge_short_scenes(scenes, min_duration=25)
-
-    # Scene burst protection
-    if len(scenes) > 40:
-        print("⚠️  Too many scenes — auto-adjusting thresholds")
-        scenes = hybrid_split(words, visual_scenes, min_dur=45, max_dur=75, pause_thresh=1.3)
-        scenes = merge_short_scenes(scenes, min_duration=30)
-
-    # FIX (critical): single guard — the duplicate was unreachable and misleading
-    if not scenes:
-        raise ValueError("No scenes generated. Adjust thresholds in editor.config.json.")
-
-    duration = scenes[-1]["end"]
-
-    # FIX (high): use actual source fps, not hardcoded 25
-    # source_fps may not be set if visual scenes came from cache — probe if needed
-    if "source_fps" not in dir():
+    if split_mode == "speech_only":
+        print("⏭️  Skipping visual scene detection (speech_only mode)")
+        # Still need source_fps for the meta JSON
         cap = cv2.VideoCapture(str(precropped))
         source_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         cap.release()
+
+    else:
+        eff_threshold = _effective_diff_threshold(SPLIT_TRANSITION_TYPE)
+        if visual_cache.exists() and not args.regen_splits:
+            with open(visual_cache, encoding="utf8") as f:
+                visual_scenes = json.load(f)
+            # Recover source_fps from cached scenes.json if available
+            if meta.exists():
+                with open(meta, encoding="utf8") as f:
+                    _m = json.load(f)
+                source_fps = _m.get("fps")
+            if not source_fps:
+                cap = cv2.VideoCapture(str(precropped))
+                source_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                cap.release()
+            print(f"   📖 Loaded {len(visual_scenes)} visual scenes from cache")
+        else:
+            print(f"🔍  Detecting visual scenes… (threshold={eff_threshold:.1f})")
+            source_fps, visual_scenes = detect_scenes(
+                str(precropped), diff_threshold=eff_threshold
+            )
+            with open(visual_cache, "w", encoding="utf8") as f:
+                json.dump(visual_scenes, f, indent=2)
+            print(f"   💾 {len(visual_scenes)} visual scenes detected")
+
+    # ── Step 3: Split scenes ─────────────────────────────────────────────────
+    print(f"🧠  Splitting [{split_mode}]…")
+
+    if split_mode == "reformat_only":
+        # Treat entire video as one scene — no splitting at all
+        print("⏭️  reformat_only — whole video as single clip")
+        # Get duration via ffprobe
+        dur_out = subprocess.check_output([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            str(precropped),
+        ], text=True).strip()
+        total_duration = float(dur_out) if dur_out else 0.0
+        scenes = [{"id": 1, "start": 0.0, "end": total_duration}]
+
+    elif split_mode == "speech_only":
+        if not words:
+            raise ValueError(
+                "speech_only mode requires transcription but words.json is empty.\n"
+                "Check that has_narration=true in config, or switch to visual_only mode."
+            )
+        scenes = split_by_speech(
+            words,
+            min_dur=SPLIT_MIN_CLIP_SEC,
+            max_dur=SPLIT_MAX_CLIP_SEC,
+            pause_thresh=SPLIT_PAUSE_THRESHOLD_SEC,
+        )
+
+    elif split_mode == "visual_only":
+        # Use visual cuts as-is; re-assign IDs after merge
+        scenes = [dict(s) for s in visual_scenes]
+        for i, s in enumerate(scenes, 1):
+            s["id"] = i
+
+    elif split_mode == "speech_primary":
+        if not words:
+            print("⚠️  No words available — falling back to visual_only for splitting")
+            scenes = [dict(s) for s in visual_scenes]
+            for i, s in enumerate(scenes, 1):
+                s["id"] = i
+        else:
+            scenes = speech_primary_split(
+                words,
+                visual_scenes,
+                min_dur=SPLIT_MIN_CLIP_SEC,
+                max_dur=SPLIT_MAX_CLIP_SEC,
+                pause_thresh=SPLIT_PAUSE_THRESHOLD_SEC,
+                snap_tolerance=SPLIT_VISUAL_CUT_SNAP_TOLERANCE_SEC,
+            )
+
+    else:  # hybrid (legacy behaviour, now driven by config values not hardcoded)
+        scenes = hybrid_split(
+            words,
+            visual_scenes,
+            min_dur=SPLIT_MIN_CLIP_SEC,
+            max_dur=SPLIT_MAX_CLIP_SEC,
+            pause_thresh=SPLIT_PAUSE_THRESHOLD_SEC,
+        )
+
+    scenes = merge_short_scenes(scenes, min_duration=SPLIT_MERGE_MIN_SEC)
+
+    # Burst protection — widen thresholds and retry once, using config values
+    if len(scenes) > SPLIT_MAX_CLIPS:
+        print(f"⚠️  {len(scenes)} clips exceeds max_clips={SPLIT_MAX_CLIPS} — widening thresholds and retrying")
+        retry_pause = SPLIT_PAUSE_THRESHOLD_SEC * 1.3
+        retry_min   = SPLIT_MIN_CLIP_SEC   * 1.3
+        retry_max   = SPLIT_MAX_CLIP_SEC   * 1.2
+
+        if split_mode == "speech_only":
+            scenes = split_by_speech(words, min_dur=retry_min, max_dur=retry_max, pause_thresh=retry_pause)
+        elif split_mode == "speech_primary" and words:
+            scenes = speech_primary_split(words, visual_scenes, min_dur=retry_min, max_dur=retry_max,
+                                          pause_thresh=retry_pause, snap_tolerance=SPLIT_VISUAL_CUT_SNAP_TOLERANCE_SEC)
+        elif split_mode == "hybrid":
+            scenes = hybrid_split(words, visual_scenes, min_dur=retry_min, max_dur=retry_max, pause_thresh=retry_pause)
+        # visual_only: just merge more aggressively below
+
+        scenes = merge_short_scenes(scenes, min_duration=SPLIT_MERGE_MIN_SEC * 1.5)
+        print(f"   → {len(scenes)} clips after retry")
+
+    if not scenes:
+        raise ValueError("No scenes generated. Adjust splitting thresholds in editor.config.json.")
+
+    duration = scenes[-1]["end"]
 
     with open(meta, "w", encoding="utf8") as f:
         json.dump(
@@ -1394,15 +2012,16 @@ Common workflows:
                 "fps":         source_fps,
                 "duration":    duration,
                 "orientation": orientation,
+                "split_mode":  split_mode,
                 "scenes":      scenes,
             },
             f,
             indent=2,
         )
 
-    print(f"   💾 {len(scenes)} hybrid scenes → {meta.name}")
+    print(f"   💾 {len(scenes)} scenes → {meta.name}")
 
-    # ── Step 4: Split scenes ──────────────────────────────────────────
+    # ── Step 4: Split scenes ──────────────────────────────────────────────────
     if args.regen_splits:
         print("🗑️  Clearing existing scene files for re-split…")
         for f in scenes_dir.glob("scene_*.mp4"):
@@ -1410,8 +2029,10 @@ Common workflows:
 
     split_video(str(precropped), scenes, scenes_dir, words, orientation=orientation)
 
-    # ── Step 5: Generate subtitle ASS files ──────────────────────────
-    if words:
+    # ── Step 5: Generate subtitle ASS files ───────────────────────────────────
+    if not SUBTITLES_ENABLED:
+        print("⏭️  Subtitles disabled (subtitles.enabled=false in config)")
+    elif words:
         subs_needed = [
             s for s in scenes
             if args.regen_subs or not (subs_dir / f"scene_{s['id']:02d}.ass").exists()
@@ -1421,25 +2042,25 @@ Common workflows:
             print(f"📝  Writing subtitles ({len(subs_needed)} scenes)…")
             for s in subs_needed:
                 sw = words_for_scene(words, s["start"], s["end"])
-                # FIX (high): pass detected_lang explicitly — no more globals()
                 write_ass(subs_dir / f"scene_{s['id']:02d}.ass", sw, detected_lang=lang)
         else:
             print("📝  All subtitle files present — skipping (use --regen-subs to regenerate)")
     else:
-        print("   ⚠️  No words available — subtitles skipped")
-        print("        Run with --regen-words to transcribe first")
+        print("   ⚠️  No words — subtitles skipped")
+        if split_mode == "visual_only" and not SPLIT_HAS_NARRATION:
+            print("        (expected: has_narration=false in config)")
+        else:
+            print("        Run with --regen-words to transcribe first")
 
-    # ── Step 6: Burn subtitles + logo onto final clips ────────────────
+    # ── Step 6: Burn subtitles + logo onto final clips ────────────────────────
     print("🎞️   Burning…")
     burned, skipped, missing = 0, 0, 0
 
     for s in tqdm(scenes, desc="🔥 Burning"):
-        base_name   = f"scene_{s['id']:02d}"
-        scene_path  = scenes_dir / f"{base_name}.mp4"
-        ass_path    = subs_dir   / f"{base_name}.ass"
+        base_name  = f"scene_{s['id']:02d}"
+        scene_path = scenes_dir / f"{base_name}.mp4"
+        ass_path   = subs_dir   / f"{base_name}.ass"
 
-        # FIX (critical): hook and summary always initialized before use.
-        # Previously caused NameError when scene had no transcribed words.
         hook    = ""
         summary = ""
         scene_words = words_for_scene(words, s["start"], s["end"])
@@ -1453,7 +2074,6 @@ Common workflows:
         final_name = f"{base_name}_{safe_hook}.mp4"
         final_path = final_dir / final_name
 
-        # Save per-scene metadata
         meta_path = final_dir / f"{base_name}.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(
@@ -1466,7 +2086,7 @@ Common workflows:
             print(f"   ⚠️  {base_name}: scene MP4 missing — skipped")
             missing += 1
             continue
-        if not ass_path.exists():
+        if not ass_path.exists() and words and SUBTITLES_ENABLED:
             print(f"   ⚠️  {base_name}: ASS file missing — skipped")
             missing += 1
             continue
@@ -1474,7 +2094,9 @@ Common workflows:
             skipped += 1
             continue
 
-        burn(scene_path, ass_path, final_path, logo_path=args.logo, force=args.force_burn)
+        # Pass None for ass when subtitles are disabled or unavailable
+        use_ass = ass_path if (SUBTITLES_ENABLED and ass_path.exists()) else None
+        burn(scene_path, use_ass, final_path, logo_path=args.logo, force=args.force_burn)
         burned += 1
 
     print(f"   ✅  burned={burned}  skipped={skipped}  missing={missing}")

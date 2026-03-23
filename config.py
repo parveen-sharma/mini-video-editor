@@ -97,11 +97,50 @@ BG_BORD            = PAD_Y + 6
 SUBTITLE_PRESET = str(CFG.get("subtitle_preset", "classic")).lower()
 
 # =========================
-# OUTPUT DIMENSIONS
+# OUTPUT PRESET
 # =========================
 
-# Portrait output — must match ASS PlayRes values exactly.
-OUT_W, OUT_H = 1080, 1920
+_OUTPUT_PRESETS = {
+    "portrait_hd":  (1080, 1920),  # TikTok, Reels, YouTube Shorts
+    "portrait_sd":  (720,  1280),  # Lighter portrait
+    "square":       (1080, 1080),  # Instagram feed
+    "landscape_hd": (1920, 1080),  # YouTube, LinkedIn
+    "landscape_sd": (1280, 720),   # Lighter YouTube
+}
+
+_out = CFG.get("output", {})
+PRESET_NAME = str(_out.get("preset", "portrait_hd")).lower()
+if PRESET_NAME not in _OUTPUT_PRESETS:
+    raise ValueError(
+        f"Unknown output preset '{PRESET_NAME}'. "
+        f"Must be one of: {list(_OUTPUT_PRESETS.keys())}"
+    )
+
+OUT_W, OUT_H = _OUTPUT_PRESETS[PRESET_NAME]
+
+# Font and margin scale factor relative to portrait_hd baseline (1920px tall).
+# All subtitle font sizes and margins are multiplied by this so they look
+# correct regardless of output resolution.
+FONT_SCALE = OUT_H / 1920.0
+
+# True for portrait_hd / portrait_sd — drives the landscape→portrait crop strategy.
+# False for square / landscape — source is scaled to fill with blurred background.
+IS_PORTRAIT_OUTPUT = OUT_H > OUT_W
+
+# =========================
+# WHISPER
+# =========================
+
+_wh = CFG.get("whisper", {})
+WHISPER_MODEL    = str(_wh.get("model",    "small")).lower()
+WHISPER_LANGUAGE = str(_wh.get("language", "auto")).lower()
+
+# =========================
+# SUBTITLES
+# =========================
+
+_sub = CFG.get("subtitles", {})
+SUBTITLES_ENABLED = bool(_sub.get("enabled", True))
 
 # =========================
 # PRE-CROP
@@ -199,12 +238,65 @@ ENCODE_CRF_SCENES   = int( _enc.get("crf_scenes",     18))
 ENCODE_AUDIO_BR     = str( _enc.get("audio_bitrate", "192k"))
 ENCODE_PRESET       = str( _enc.get("preset",        "fast"))
 
+# Audio bleed fixes — applied to every scene encode and split
+# audio_tail_trim_ms: chops this many ms from the end of the audio stream,
+#   removing AAC encoder look-ahead bleed (next-sentence audio leaking into clip end).
+ENCODE_AUDIO_TAIL_TRIM_MS = int(  _enc.get("audio_tail_trim_ms", 150))
+# audio_fadeout_ms: fades out the last N ms of audio, masking any residual bleed.
+ENCODE_AUDIO_FADEOUT_MS   = int(  _enc.get("audio_fadeout_ms",    80))
+# accurate_seek: moves -ss after -i for sample-accurate cuts. Slower (~2-4x) but
+#   eliminates keyframe-misalignment at clip start/end. Default false.
+ENCODE_ACCURATE_SEEK      = bool(_enc.get("accurate_seek",       False))
+
 # =========================
 # SCENE SNAPPING
 # =========================
 
 # Maximum seconds a scene boundary can move to align with a word end.
 SNAP_TOLERANCE_SEC = float(CFG.get("snap_tolerance_sec", 1.0))
+
+# =========================
+# SPLITTING
+# =========================
+# All splitting / scene-boundary behaviour is driven from here.
+# Previously these values were hardcoded magic numbers inside main().
+
+_spl = CFG.get("splitting", {})
+
+# Master strategy switch
+SPLIT_MODE = str(_spl.get("mode", "speech_only")).lower()
+
+# Transition type affects the visual diff threshold:
+#   cut   → standard threshold (hard cuts)
+#   fade  → raised threshold (fades/animations produce gradual ramps, not spikes)
+#   mixed → middle ground
+SPLIT_TRANSITION_TYPE = str(_spl.get("transition_type", "fade")).lower()
+
+# Whether the video contains narration audio.
+# False → skip Whisper entirely in visual_only mode.
+SPLIT_HAS_NARRATION = bool(_spl.get("has_narration", True))
+
+# Whisper word confidence gate — words below this are treated as ambient noise.
+SPLIT_MIN_WORD_CONFIDENCE = float(_spl.get("min_word_confidence", 0.6))
+
+# Clip duration bounds (seconds)
+SPLIT_MIN_CLIP_SEC = float(_spl.get("min_clip_sec", 30.0))
+SPLIT_MAX_CLIP_SEC = float(_spl.get("max_clip_sec", 60.0))
+
+# Pause threshold for speech splitting (seconds)
+SPLIT_PAUSE_THRESHOLD_SEC = float(_spl.get("pause_threshold_sec", 1.2))
+
+# After splitting, absorb clips shorter than this into neighbours
+SPLIT_MERGE_MIN_SEC = float(_spl.get("merge_min_sec", 20.0))
+
+# Burst protection ceiling — absolute clip count
+SPLIT_MAX_CLIPS = int(_spl.get("max_clips", 30))
+
+# speech_primary: how close a visual cut must be to a speech boundary to trigger a snap
+SPLIT_VISUAL_CUT_SNAP_TOLERANCE_SEC = float(_spl.get("visual_cut_snap_tolerance_sec", 1.5))
+
+# speech_primary: minimum frame-diff energy to treat a visual cut as meaningful
+SPLIT_VISUAL_CUT_MIN_ENERGY = float(_spl.get("visual_cut_min_energy", 30.0))
 
 # =========================
 # LOGO
