@@ -37,14 +37,14 @@
     "enabled": true,
     "corner": "top-right",
     "width_pct": 0.12,
-    "margin_x": 30,
-    "margin_y": 30,
+    "margin_x": 35,
+    "margin_y": 35,
     "opacity": 0.85
   },
   "processing": {
     "scene_detection": {
-      "sample_fps": 6.0,
-      "diff_threshold": 22.0,
+      "sample_fps": 10.0,
+      "diff_threshold": 10.5,
       "min_duration_sec": 1.0
     },
     "motion_analysis": {
@@ -55,24 +55,24 @@
     },
     "background_blur": {
       "ffmpeg_luma_radius": 40,
-      "ffmpeg_luma_power": 3,
-      "opencv_kernel_size": 81
+      "ffmpeg_luma_power": 4,
+      "opencv_kernel_size": 75
     },
     "zoom_out": {
       "enabled": true,
-      "max_pct_of_scene": 0.1
+      "max_pct_of_scene": 0.25
     },
     "encode": {
-      "crf_precrop": 16,
-      "crf_scenes": 18,
+      "crf_precrop": 18,
+      "crf_scenes": 20,
       "audio_bitrate": "192k",
       "preset": "fast",
       "audio_tail_trim_ms": 150,
-      "audio_fadeout_ms": 80,
+      "audio_fadeout_ms": 100,
       "accurate_seek": false
     },
     "face_detection": {
-      "enabled": false
+      "enabled": true
     }
   },
   "precrop": {
@@ -82,17 +82,17 @@
     "vertical_anchor": "top"
   },
   "splitting": {
-    "mode": "speech_only",
+    "mode": "hybrid",
     "transition_type": "fade",
     "has_narration": true,
-    "min_word_confidence": 0.6,
-    "min_clip_sec": 20.0,
-    "max_clip_sec": 61.0,
-    "pause_threshold_sec": 1.2,
-    "merge_min_sec": 15.0,
-    "max_clips": 30,
-    "visual_cut_snap_tolerance_sec": 1.5,
-    "visual_cut_min_energy": 30.0
+    "min_word_confidence": 0.5,
+    "min_clip_sec": 25.0,
+    "max_clip_sec": 90.0,
+    "pause_threshold_sec": 0.4,
+    "merge_min_sec": 10.0,
+    "max_clips": 8,
+    "visual_cut_snap_tolerance_sec": 0.8,
+    "visual_cut_min_energy": 40.0
   },
   "whisper": {
     "model": "small",
